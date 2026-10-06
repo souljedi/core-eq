@@ -87,7 +87,7 @@ headphone corrections in — or as CoreEQ's own =.coreeq= files. Import from the
 =+= at the bottom of the sidebar, paste with =⌘V=, or drop a file onto the
 preset list; every import shows what it found before anything is added. The
 *AutoEq* button beside the =+= opens the catalog directly; for a correction from
-autoeq.app by hand, use *Import by Hand…* in the catalog window.
+autoeq.app by hand, use *Import by Hand…* in the catalog sheet.
 
 From EqualizerAPO text, CoreEQ reads =Preamp:= and =PK=, =LSC=, =HSC=, =HP= and
 =LP= filters, with Q or bandwidth in octaves. It reads UTF-8, UTF-16 and
@@ -107,15 +107,14 @@ included.
 
 CoreEQ can fetch a headphone correction straight from [[https://autoeq.app][AutoEq]], without
 downloading a file by hand. The *AutoEq* button beside the =+= opens the catalog
-window directly. For corrections AutoEq computes for a target you choose there,
-use *Import by Hand…* in the catalog window's action row: it closes the catalog,
-opens the step-by-step guide on the main window, and the correction you paste
-lands in your preset list.
+sheet directly. For corrections AutoEq computes for a target you choose there,
+use *Import by Hand…* in the sheet's action row: it closes the catalog, opens
+the step-by-step guide on the main window, and the correction you paste lands
+in your preset list.
 
-The catalog is its own window, so it can stay open beside the equalizer while
-you listen. Type in the search field to find a model by name — the catalog holds
-thousands and matches as you type. A model measured more than once says how many
-measurements it has.
+The catalog sheet keeps the equalizer in context while you listen. Type in the
+search field to find a model by name — the catalog holds thousands and matches
+as you type. A model measured more than once says how many measurements it has.
 
 Two menus decide which correction you get:
 
@@ -126,11 +125,11 @@ Two menus decide which correction you get:
   Harman in-ear 2019, AutoEq in-ear, and others. Only the targets that apply to
   the chosen measurement are offered.
 
-*Audition* applies the correction to the sound immediately, without saving
-anything, so you can hear it against your own music; *Stop Auditioning*, or
-closing the window, puts the previous sound back. *Save to My Presets* converts
-the correction and keeps it as one of your own presets, named after the model,
-where it can be edited and exported like any other.
+Selecting a model, measurement, or target plays a preview after a short pause,
+without saving anything, so you can hear it against your own music. *Cancel*
+puts the previous sound back. *Import* converts the correction and keeps it as
+one of your own presets, named after the model, where it can be edited and
+exported like any other.
 
 The catalog is downloaded once and cached, so browsing stays instant and works
 offline; with no network and no cached copy, the window says so and offers to

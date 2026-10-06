@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 /// The AutoEQ catalog browser: a window for finding a headphone correction,
@@ -67,6 +68,10 @@ struct AutoEQBrowserView: View {
         .onChange(of: store.selectedModelName) { _, _ in selectionDidChange() }
         .onChange(of: store.selectedVariant) { _, _ in selectionDidChange() }
         .onChange(of: store.selectedTargetLabel) { _, _ in selectionDidChange() }
+        .onChange(of: store.previewProfile) { _, profile in
+            guard let profile else { return }
+            profileManager.beginAudition(profile)
+        }
         // The preview is the window's own. Leaving takes it down rather than
         // leaving a curve playing that the user can no longer see — a window's
         // `onDisappear` does not fire when it is only ordered out, so the
@@ -313,6 +318,29 @@ struct AutoEQBrowserView: View {
             labeled("Measurement source") { measurementControl }
             labeled("Target curve") { targetControl }
 
+            if let profile = store.previewProfile {
+                GeometryReader { geometry in
+                    FrequencyResponseView(
+                        filters: profile.filters,
+                        sampleRate: 44_100,
+                        preamp: profile.preamp,
+                        compact: true,
+                        showsBackground: false
+                    )
+                    .frame(
+                        width: geometry.size.width * FrequencyResponseView.compactWidthFraction,
+                        height: geometry.size.width
+                            * FrequencyResponseView.compactWidthFraction
+                            / FrequencyResponseView.compactAspectRatio
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+                // The outer frame gives the GeometryReader a real height;
+                // the inner graph stays narrower and preserves its own ratio.
+                .frame(height: FrequencyResponseView.compactPreviewHeight)
+                .accessibilityLabel("Preview response curve")
+            }
+
             // A variant with no rig cannot be sent to AutoEQ's equalizer, so
             // the target choice does not apply to it. Say so rather than
             // offering a control that would silently do nothing.
@@ -472,7 +500,7 @@ struct AutoEQBrowserView: View {
                     .frame(width: 6, height: 6)
                     .accessibilityHidden(true)
 
-                Text("Auditioning “\(store.previewProfile?.name ?? "preview")”")
+                Text("Playing preview “\(store.previewProfile?.name ?? "preview")”")
                     .font(Theme.Font.label)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -482,7 +510,7 @@ struct AutoEQBrowserView: View {
             case .idle:
                 Text(
                     store.selectedModelName == nil
-                        ? "Choose a model to get started." : "Ready to audition."
+                        ? "Choose a model to get started." : "Preview follows your selection."
                 )
                 .font(Theme.Font.label)
                 .foregroundStyle(.secondary)
@@ -495,7 +523,7 @@ struct AutoEQBrowserView: View {
                         .foregroundStyle(.secondary)
                 }
             case .ready:
-                Text("Preview ready, \(store.previewProfile?.filters.count ?? 0) filters")
+                Text("Playing preview, \(store.previewProfile?.filters.count ?? 0) filters")
                     .font(Theme.Font.label)
                     .foregroundStyle(.secondary)
             case .failed(let message):
@@ -510,7 +538,7 @@ struct AutoEQBrowserView: View {
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    Button("Retry") { startAudition() }
+                    Button("Retry") { store.schedulePreview(after: 0) }
                         .controlSize(.small)
                 }
             }
@@ -532,21 +560,14 @@ struct AutoEQBrowserView: View {
 
             Spacer(minLength: 12)
 
-            if profileManager.isAuditioning {
-                Button("Stop Auditioning") { stopAudition() }
-                    .buttonStyle(.bordered)
+            Button("Cancel") { cancel() }
+                .buttonStyle(.bordered)
+                .keyboardShortcut(.cancelAction)
 
-                Button("Save to My Presets") { saveToPresets() }
-                    .buttonStyle(.borderedProminent)
-            } else {
-                Button("Audition") { startAudition() }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!canPreview)
-
-                Button("Save to My Presets") { saveToPresets() }
-                    .buttonStyle(.bordered)
-                    .disabled(!canPreview)
-            }
+            Button("Import") { saveToPresets() }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.defaultAction)
+                .disabled(!canPreview)
         }
     }
 
@@ -604,65 +625,56 @@ struct AutoEQBrowserView: View {
         return shown == 1 ? "1 match" : "\(shown) matches"
     }
 
-    /// Whether the current selection is complete enough to build a preview.
+    /// Whether a current preview is ready to import.
     private var canPreview: Bool {
-        store.selectedModelName != nil
-            && store.selectedVariant != nil
-            && store.selectedTargetLabel != nil
-            && store.previewState != .loading
+        store.previewState == .ready && store.previewProfile != nil
     }
 
     // MARK: - Actions
 
-    /// Fetches the selected profile and plays it. Called by both the primary
-    /// action and the failure state's Retry.
-    private func startAudition() {
-        Task {
-            if let profile = await store.loadSelectedProfile() {
-                profileManager.beginAudition(profile)
-            }
-        }
-    }
-
-    private func stopAudition() {
-        profileManager.endAudition()
-        store.clearPreview()
-    }
-
     /// Ends an audition if one is running. Used when the sheet goes or the
     /// selection moves on under it.
     private func stopAuditionIfNeeded() {
-        guard profileManager.isAuditioning else { return }
-        stopAudition()
+        profileManager.endAudition()
+        store.cancelPreview()
     }
 
-    /// A change of model, variant, or target invalidates the preview. Stopping
-    /// the audition restores the state from before it; clearing the preview
-    /// drops the curve so the next action builds one for the new selection.
+    /// A change of model, variant, or target restores the original sound and
+    /// schedules a debounced preview for the new selection.
     private func selectionDidChange() {
         stopAuditionIfNeeded()
-        store.clearPreview()
+        store.schedulePreview()
     }
 
-    /// Keeps the previewed chain as a user preset. Loads and auditions first
-    /// when nothing is playing yet, so one click is enough from a cold start.
+    private func cancel() {
+        profileManager.endAudition()
+        store.cancelPreview()
+        onClose()
+    }
+
+    /// Keeps the previewed chain as a user preset. Previewing follows the
+    /// selection, so Import only commits the profile already being heard.
     private func saveToPresets() {
-        Task {
-            guard let profile = await ensureAuditioning() else { return }
-            guard profileManager.isAuditioning else { return }
-            if profileManager.saveAuditionAsPreset(named: profile.name) != nil {
-                store.clearPreview()
-                onClose()
-            }
+        guard let profile = store.previewProfile, canPreview else { return }
+        if !profileManager.isAuditioning {
+            profileManager.beginAudition(profile)
+        }
+        if profileManager.saveAuditionAsPreset(named: profile.name) != nil {
+            store.cancelPreview()
+            onClose()
         }
     }
+}
 
-    private func ensureAuditioning() async -> EQProfile? {
-        if profileManager.isAuditioning, store.previewState == .ready {
-            return store.previewProfile
-        }
-        guard let profile = await store.loadSelectedProfile() else { return nil }
-        profileManager.beginAudition(profile)
-        return profile
-    }
+/// Routes the catalog into the main window's sheet. A counter makes every
+/// click a distinct event, even when the sheet was dismissed moments earlier.
+@MainActor
+final class AutoEQBrowserRoute: ObservableObject {
+    static let shared = AutoEQBrowserRoute()
+
+    @Published private(set) var request = 0
+
+    func requestBrowser() { request &+= 1 }
+
+    private init() {}
 }

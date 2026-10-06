@@ -24,10 +24,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// the browser window closing and reopening. The window below reads it.
     private let autoEQStore = AutoEQStore()
 
-    /// The catalog's own window, kept so that reopening brings the one already
-    /// open to the front rather than stacking a duplicate.
-    private var autoEQWindow: NSWindow?
-
     /// Held because the toolbar's tracking separator needs the split view, and
     /// the toolbar is asked for its items while the window is still being built.
     private var splitViewController: NSSplitViewController?
@@ -99,7 +95,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 sidebarWithViewController: NSHostingController(
                     rootView: EqualizerSidebarView(
                         profileManager: profileManager,
-                        openAutoEQBrowser: { [weak self] in self?.showAutoEQBrowserWindow() }
+                        autoEQStore: autoEQStore,
+                        openAutoEQBrowser: { AutoEQBrowserRoute.shared.requestBrowser() }
                     )
                 )
             )
@@ -226,89 +223,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         audioEngine.spectrum.start()
     }
 
-    // MARK: - AutoEQ catalog window
-
-    /// Opens the AutoEQ catalog in its own window, or brings the open one
-    /// forward.
-    ///
-    /// A window rather than the sheet this began as: browsing six thousand
-    /// models and hearing each candidate is a job done with the equalizer beside
-    /// it, and a sheet blocks the window it is attached to. Built by hand and
-    /// owned here, like the main window, because CoreEQ is an accessory
-    /// application with no `WindowGroup` to open it from.
-    private func showAutoEQBrowserWindow() {
-        if autoEQWindow == nil {
-            autoEQWindow = makeAutoEQBrowserWindow()
-        }
-        if let autoEQWindow { AppActivation.bringForward(autoEQWindow) }
-    }
-
-    private func makeAutoEQBrowserWindow() -> NSWindow {
-        let content = NSHostingController(
-            rootView: AutoEQBrowserView(
-                store: autoEQStore,
-                profileManager: profileManager,
-                onClose: { [weak self] in self?.autoEQWindow?.close() },
-                onImportByHand: { [weak self] in self?.showAutoEQImportGuide() }
-            )
-        )
-        // The window owns its size and the content lays out inside it, as in the
-        // main window: an intrinsic size here would let AppKit grow the window
-        // past what the screen can show.
-        content.sizingOptions = []
-
-        let window = NSWindow(contentViewController: content)
-        window.title = "Browse AutoEq Catalog"
-        // A standard titled window: the traffic lights, a grounded title, and
-        // the red close dot the other windows have.
-        window.styleMask = [.titled, .closable, .miniaturizable, .resizable]
-        // Closing only orders it out, so the catalog and the selection are still
-        // there when it is reopened.
-        window.isReleasedWhenClosed = false
-        window.autorecalculatesKeyViewLoop = true
-        window.contentMinSize = Self.autoEQBrowserMinimumSize
-        window.setContentSize(Self.autoEQBrowserPreferredSize)
-        window.center()
-        window.delegate = self
-        return window
-    }
-
-    /// The catalog window's minimum and opening size.
-    ///
-    /// The width is the one the sheet laid its two dropdowns out at, so neither
-    /// truncates; the height leaves the list room once the header, search field,
-    /// configuration card, and action row are placed, and the opening size is
-    /// the 600 × 680 the sheet used.
-    private static let autoEQBrowserMinimumSize = CGSize(width: 600, height: 520)
-    private static let autoEQBrowserPreferredSize = CGSize(width: 600, height: 680)
-
-    /// Ends any audition the catalog window started and drops its preview.
-    ///
-    /// The browser's own `onDisappear` never fires when a closed window is
-    /// merely ordered out, so the window has to say. Idempotent: `endAudition`
-    /// is a no-op when nothing is being auditioned.
-    private func endAutoEQBrowserAudition() {
-        autoEQStore.clearPreview()
-        profileManager.endAudition()
-    }
-
-    /// Leaves the catalog for the by-hand import.
-    ///
-    /// The manual route finishes in a preset that belongs to the sidebar list, so
-    /// it is done on the main window rather than over the catalog: the window is
-    /// closed (which ends any audition it started, as leaving it always does), the
-    /// main window is brought forward, and the sidebar is asked to raise the guide
-    /// once that has settled. Requesting the sheet in the same turn as the
-    /// activation can leave it attaching to a window mid-transition.
-    private func showAutoEQImportGuide() {
-        autoEQWindow?.close()
-        showMainWindow()
-        if let mainWindow { AppActivation.bringForward(mainWindow) }
-        Task { @MainActor in
-            AutoEQGuideRoute.shared.requestGuide()
-        }
-    }
-
 }
 
 /// Analysis follows the window's visibility.
@@ -320,14 +234,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 extension AppDelegate: NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow else { return }
-        // The catalog window is not the main one: closing it ends the audition
-        // it started — leaving must not keep a curve playing that the user can
-        // no longer see — and leaves the analyzer running for the plot that is
-        // still on screen.
-        if window === autoEQWindow {
-            endAutoEQBrowserAudition()
-            return
-        }
         guard window === mainWindow else { return }
         audioEngine.spectrum.stop()
     }

@@ -38,6 +38,7 @@ final class AutoEQStore: ObservableObject {
     /// Invalidates responses from preview requests that no longer match the
     /// current selection (or have been explicitly cleared).
     private var previewRequestID = UUID()
+    private var previewTask: Task<Void, Never>?
 
     init(service: AutoEQNetworkService = AutoEQNetworkService()) {
         self.service = service
@@ -176,7 +177,8 @@ final class AutoEQStore: ObservableObject {
                 profile = try AutoEQProfileBuilder.makeProfile(
                     model: model.name, parametricEQText: text)
             }
-            guard previewRequestID == requestID,
+            guard !Task.isCancelled,
+                previewRequestID == requestID,
                 selectedModelName == model.name,
                 selectedVariant == variant,
                 selectedTargetLabel == targetLabel
@@ -185,14 +187,39 @@ final class AutoEQStore: ObservableObject {
             previewState = .ready
             return profile
         } catch {
-            guard previewRequestID == requestID else { return nil }
+            guard !Task.isCancelled, previewRequestID == requestID else { return nil }
             previewProfile = nil
             previewState = .failed(Self.message(for: error))
             return nil
         }
     }
 
+    /// Follows a selection after a short pause, so moving through the model,
+    /// measurement, or target lists does not make a request for every row.
+    func schedulePreview(after delay: UInt64 = 300_000_000) {
+        cancelPreview()
+        previewTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: delay)
+            } catch {
+                return
+            }
+            guard let self, !Task.isCancelled else { return }
+            _ = await self.loadSelectedProfile()
+        }
+    }
+
     func clearPreview() {
+        previewTask?.cancel()
+        previewTask = nil
+        previewRequestID = UUID()
+        previewProfile = nil
+        previewState = .idle
+    }
+
+    func cancelPreview() {
+        previewTask?.cancel()
+        previewTask = nil
         previewRequestID = UUID()
         previewProfile = nil
         previewState = .idle

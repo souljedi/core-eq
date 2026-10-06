@@ -42,7 +42,7 @@ struct AutoEQNetworkServiceTests {
         // The documented User-Agent goes out on every request.
         #expect(
             StubURLProtocol.requests.allSatisfy {
-                $0.value(forHTTPHeaderField: "User-Agent") == "CoreEQ/1.0"
+                $0.value(forHTTPHeaderField: "User-Agent") == AutoEQNetworkService.userAgent
             })
     }
 
@@ -108,6 +108,15 @@ struct AutoEQNetworkServiceTests {
         #expect(profile.filters[0].fc == 105.0)
         #expect(profile.filters[1].type == "LOW_SHELF")
         #expect(StubURLProtocol.requests.first?.httpMethod == "POST")
+
+        // The same selection is deterministic, so a second preview is served
+        // from the service cache without another server call.
+        _ = try await service.equalize(
+            model: "Alpha Headphones", variant: variant, targetLabel: "Harman over-ear 2013")
+        #expect(StubURLProtocol.requests.count == 1)
+        #expect(
+            StubURLProtocol.requests.first?.value(forHTTPHeaderField: "User-Agent")
+                == AutoEQNetworkService.userAgent)
     }
 
     @Test func equalizeNon200ThrowsHTTPStatus() async throws {

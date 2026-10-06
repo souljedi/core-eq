@@ -123,8 +123,8 @@ struct AutoEQGuideSheet: View {
 
 /// Asks the sidebar to put the by-hand guide up.
 ///
-/// The catalog window cannot present a sheet over the main window, and it closes
-/// on its way out, so the request is left here for the sidebar to pick up. A
+/// The catalog sheet presents the guide on its way out, so the request is left
+/// here for the sidebar to pick up. A
 /// counter rather than a flag: each request is a distinct event, so opening the
 /// guide twice raises it twice. It is not persisted — the guide is a detour, not
 /// a place the app returns to, the way `SettingsRoute` chooses a tab every time.

@@ -16,6 +16,13 @@ actor AutoEQNetworkService {
 
     private let session: URLSession
     private let cacheDirectory: URL
+    private var equalizedProfiles: [EqualizeCacheKey: AutoEQEqualizedProfile] = [:]
+
+    static var userAgent: String {
+        let version =
+            Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
+        return "CoreEQ/\(version ?? "development")"
+    }
 
     private var entriesFileURL: URL { cacheDirectory.appendingPathComponent("entries.json") }
     private var targetsFileURL: URL { cacheDirectory.appendingPathComponent("targets.json") }
@@ -63,6 +70,16 @@ actor AutoEQNetworkService {
     ) async throws -> AutoEQEqualizedProfile {
         guard variant.rig != nil else { throw AutoEQError.unsupportedVariant }
 
+        try Task.checkCancellation()
+        let cacheKey = EqualizeCacheKey(
+            model: model,
+            source: variant.source,
+            rig: variant.rig,
+            target: targetLabel)
+        if let cached = equalizedProfiles[cacheKey] {
+            return cached
+        }
+
         let body = EqualizeRequest(
             name: model,
             source: variant.source,
@@ -76,7 +93,7 @@ actor AutoEQNetworkService {
         var request = URLRequest(url: Self.equalizeURL)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("CoreEQ/1.0", forHTTPHeaderField: "User-Agent")
+        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         do {
             request.httpBody = try JSONEncoder().encode(body)
         } catch {
@@ -84,6 +101,7 @@ actor AutoEQNetworkService {
         }
 
         let (data, response) = try await session.data(for: request)
+        try Task.checkCancellation()
         guard let http = response as? HTTPURLResponse else {
             throw AutoEQError.invalidResponse
         }
@@ -97,11 +115,13 @@ actor AutoEQNetworkService {
         } catch {
             throw AutoEQError.malformedData
         }
-        return AutoEQEqualizedProfile(
+        let profile = AutoEQEqualizedProfile(
             filters: decoded.parametricEQ.filters.map {
                 AutoEQEqualizedFilter(type: $0.type, fc: $0.fc, q: $0.q, gain: $0.gain)
             },
             preamp: decoded.parametricEQ.preamp)
+        equalizedProfiles[cacheKey] = profile
+        return profile
     }
 
     /// Fetches AutoEQ's pre-computed parametric EQ text, the fallback for
@@ -146,7 +166,7 @@ actor AutoEQNetworkService {
     /// `nonisolated` so the two catalog requests can run concurrently.
     private nonisolated func fetchData(from url: URL) async throws -> Data {
         var request = URLRequest(url: url)
-        request.setValue("CoreEQ/1.0", forHTTPHeaderField: "User-Agent")
+        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else {
             throw AutoEQError.invalidResponse
@@ -218,6 +238,13 @@ actor AutoEQNetworkService {
         let identifier = Bundle.main.bundleIdentifier ?? "CoreEQ"
         return base.appendingPathComponent(identifier).appendingPathComponent("AutoEQ")
     }
+}
+
+private struct EqualizeCacheKey: Hashable {
+    let model: String
+    let source: String
+    let rig: String?
+    let target: String
 }
 
 // MARK: - Wire types

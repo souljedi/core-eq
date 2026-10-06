@@ -72,6 +72,24 @@ struct FrequencyResponseView: View {
     /// Apple's EQ preview. Defaults to the full interactive plot.
     var minimal = false
 
+    /// Compact read-only presentation for previews that still need the same
+    /// frequency and gain context as the main graph. The full graph labels
+    /// every band; compact mode keeps five evenly spaced anchors.
+    var compact = false
+
+    /// The ratio used by the catalog preview. It follows the main graph's
+    /// readable shape without letting the small catalog card become a tall
+    /// editor panel.
+    static let compactAspectRatio: CGFloat = 3
+
+    /// Leaves breathing room around the compact graph instead of stretching
+    /// it edge to edge across the configuration card.
+    static let compactWidthFraction: CGFloat = 0.75
+
+    /// A concrete height is needed when the compact graph is placed in a
+    /// VStack: GeometryReader otherwise has no intrinsic height to contribute.
+    static let compactPreviewHeight: CGFloat = 142
+
     /// Draws the plot's own rounded backdrop. Turned off in the main window,
     /// where the enclosing section card already supplies the surface.
     var showsBackground = true
@@ -338,11 +356,21 @@ struct FrequencyResponseView: View {
         let bottom = plotHeight(size)
         let left = axisGutter
         let axis = axis(size)
+        let compactIndices = [
+            0, anchors.count / 4, anchors.count / 2,
+            anchors.count * 3 / 4, anchors.count - 1,
+        ]
+        let labelFrequencies =
+            compact
+            ? compactIndices.compactMap { index in
+                anchors.indices.contains(index) ? anchors[index] : nil
+            }
+            : anchors
 
         // Dotted verticals on the band centers are the whole grid — the major
         // frequency divisions, and nothing else competing with the curve.
         var verticals = Path()
-        for frequency in anchors {
+        for frequency in compact ? labelFrequencies : anchors {
             let x = axis.x(frequency)
             verticals.move(to: CGPoint(x: x, y: 0))
             verticals.addLine(to: CGPoint(x: x, y: bottom))
@@ -360,7 +388,7 @@ struct FrequencyResponseView: View {
         zeroLine.addLine(to: CGPoint(x: size.width, y: zeroY))
         context.stroke(zeroLine, with: .color(.primary.opacity(0.14)), lineWidth: 1)
 
-        for frequency in anchors {
+        for frequency in labelFrequencies {
             let label = Text(BandFormat.frequency(frequency))
                 .font(Theme.Font.secondary)
                 .foregroundStyle(.secondary)

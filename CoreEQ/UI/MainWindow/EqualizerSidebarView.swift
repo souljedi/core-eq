@@ -11,16 +11,16 @@ import UniformTypeIdentifiers
 /// window controls, so the view itself draws no background of its own.
 struct EqualizerSidebarView: View {
     @ObservedObject var profileManager: ProfileManager
+    let autoEQStore: AutoEQStore
 
-    /// Opens the AutoEQ catalog window, or brings the open one forward. The app
-    /// owns both the catalog store and the window, so this is the sidebar's only
-    /// part in it.
+    /// Requests that the main window present the AutoEQ catalog sheet.
     let openAutoEQBrowser: () -> Void
 
     /// The catalog's request to show the by-hand guide here. The catalog closes
     /// itself and taps this instead of presenting the guide, because the paste
     /// it starts ends in a preset this list owns.
     @ObservedObject private var guideRoute = AutoEQGuideRoute.shared
+    @ObservedObject private var autoEQRoute = AutoEQBrowserRoute.shared
 
     /// Filters the list. Empty means everything, in sections.
     @State private var search = ""
@@ -50,6 +50,7 @@ struct EqualizerSidebarView: View {
 
     /// Controls visibility of the AutoEQ guide sheet.
     @State private var showingAutoEQGuide = false
+    @State private var showingAutoEQBrowser = false
     /// Set by the guide's Paste button: the clipboard is read once the sheet
     /// has gone.
     @State private var pasteAfterGuide = false
@@ -180,9 +181,21 @@ struct EqualizerSidebarView: View {
                 showingAutoEQGuide = false
             }
         }
-        // The catalog's "Import by Hand…" closes that window and asks for the
-        // guide here, on the main window the paste will land in.
         .onChange(of: guideRoute.request) { _, _ in showingAutoEQGuide = true }
+        .sheet(isPresented: $showingAutoEQBrowser) {
+            AutoEQBrowserView(
+                store: autoEQStore,
+                profileManager: profileManager,
+                onClose: { showingAutoEQBrowser = false },
+                onImportByHand: {
+                    showingAutoEQBrowser = false
+                    DispatchQueue.main.async {
+                        AutoEQGuideRoute.shared.requestGuide()
+                    }
+                }
+            )
+        }
+        .onChange(of: autoEQRoute.request) { _, _ in showingAutoEQBrowser = true }
         // A preset created outside the sidebar arrives as a rename request; seed
         // the field with the generated name so typing replaces it.
         .onChange(of: profileManager.profileAwaitingRename) { _, name in
@@ -199,12 +212,11 @@ struct EqualizerSidebarView: View {
     }
 
     /// True while a dialog or sheet is up, so ⌘V cannot open a second one behind
-    /// it. The AutoEQ catalog is deliberately absent: it is a separate,
-    /// non-modal window, so pasting into the main window while it is open is
-    /// exactly what should happen.
+    /// it. The catalog is a sheet, so clipboard commands stay with it until
+    /// the user returns to the main window.
     private var isPresentingModal: Bool {
         pendingImport != nil || deletionCandidate != nil || importErrorMessage != nil
-            || exportErrorMessage != nil || showingAutoEQGuide
+            || exportErrorMessage != nil || showingAutoEQGuide || showingAutoEQBrowser
     }
 
     /// App mark and name — an identity block that is also the way into About.
@@ -639,7 +651,7 @@ struct EqualizerSidebarView: View {
 
             // The same kind of borderless control as the `+`, so both read as
             // the bar's chrome and neither outshouts the list. A button rather
-            // than a menu: AutoEQ now has one way in — the catalog window —
+            // than a menu: AutoEQ now has one way in — the catalog sheet —
             // and the guide to autoeq.app's optimizer lives inside it.
             Button {
                 openAutoEQBrowser()
