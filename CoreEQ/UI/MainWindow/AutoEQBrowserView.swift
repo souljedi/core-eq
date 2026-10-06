@@ -2,10 +2,10 @@ import AppKit
 import Combine
 import SwiftUI
 
-/// The AutoEQ catalog browser: a window for finding a headphone correction,
+/// The AutoEQ catalog browser: a sheet for finding a headphone correction,
 /// choosing how it was measured, hearing it, and keeping it.
 ///
-/// The catalog is six thousand models deep, so the window is built around one
+/// The catalog has thousands of models, so the window is built around one
 /// field and one list. Everything the list feeds — the measurement source, the
 /// target curve, the audition — sits under it, in that order, because that is
 /// the order the choice is made in.
@@ -53,21 +53,23 @@ struct AutoEQBrowserView: View {
         }
         // A floor rather than a fixed size: the view is a window's content now,
         // so it lays out in whatever the window is given, and the window's own
-        // minimum keeps the two dropdowns from truncating.
+        // minimum keeps the measurement dropdown from truncating.
         .frame(minWidth: 600, minHeight: 520)
         .task {
-            // Loaded once. Reopening the window reuses the catalog already in
-            // the store; a failed load offers its own Retry rather than
-            // refetching on every appearance.
-            if store.catalogState == .idle {
-                await store.loadCatalog()
-            }
+            store.resetSelectionForBrowserOpen()
+            // First-use download starts here, never at app launch. Reopening
+            // checks cache freshness before making an update request.
+            await store.loadCatalog()
         }
         // Changing what is selected drops the preview and any audition with it,
         // so an action cannot apply a curve that no longer matches the controls.
         .onChange(of: store.selectedModelName) { _, _ in selectionDidChange() }
         .onChange(of: store.selectedVariant) { _, _ in selectionDidChange() }
         .onChange(of: store.selectedTargetLabel) { _, _ in selectionDidChange() }
+        .onChange(of: store.catalogRevision) { _, _ in selectionDidChange() }
+        .onChange(of: store.catalogState) { _, state in
+            if state == .loaded && store.selectedModelName != nil { selectionDidChange() }
+        }
         .onChange(of: store.previewProfile) { _, profile in
             guard let profile else { return }
             profileManager.beginAudition(profile)
@@ -76,14 +78,9 @@ struct AutoEQBrowserView: View {
         // leaving a curve playing that the user can no longer see — a window's
         // `onDisappear` does not fire when it is only ordered out, so the
         // window's delegate ends the audition too. Ending it twice is safe.
-        .onDisappear { stopAuditionIfNeeded() }
-        // ⌘W, because CoreEQ is an accessory application with no main menu to
-        // carry the standard Close key equivalent, and a shortcut declared in a
-        // view belongs to the window that view is in.
-        .background {
-            Button("Close Window") { onClose() }
-                .keyboardShortcut("w", modifiers: .command)
-                .hidden()
+        .onDisappear {
+            store.cancelCatalogLoad()
+            stopAuditionIfNeeded()
         }
     }
 
@@ -103,13 +100,33 @@ struct AutoEQBrowserView: View {
 
     private var catalogLoadingView: some View {
         VStack(spacing: 12) {
-            ProgressView()
-                .controlSize(.small)
-            Text("Loading the AutoEq catalog…")
+            ProgressView(value: store.catalogProgress.fraction)
+                .progressViewStyle(.linear)
+                .frame(width: 260)
+                .accessibilityLabel(store.catalogProgress.message)
+            Text(store.catalogProgress.message)
                 .font(Theme.Font.label)
                 .foregroundStyle(.secondary)
+            if case .downloading(let received, let total) = store.catalogProgress {
+                Text(downloadSummary(received: received, total: total))
+                    .font(Theme.Font.secondary)
+                    .foregroundStyle(.secondary)
+            }
+            Button("Cancel") {
+                cancel()
+            }
+            .buttonStyle(.bordered)
+            .keyboardShortcut(.cancelAction)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func downloadSummary(received: Int, total: Int?) -> String {
+        let receivedText = ByteCountFormatter.string(
+            fromByteCount: Int64(received), countStyle: .file)
+        guard let total else { return "\(receivedText) downloaded" }
+        let totalText = ByteCountFormatter.string(fromByteCount: Int64(total), countStyle: .file)
+        return "\(receivedText) of \(totalText)"
     }
 
     private func catalogErrorView(_ message: String) -> some View {
@@ -167,6 +184,18 @@ struct AutoEQBrowserView: View {
             Text(searchSummary)
                 .font(Theme.Font.secondary)
                 .foregroundStyle(.secondary)
+            if store.catalogIsStale {
+                HStack {
+                    Text("Using a saved catalog. Couldn’t check for updates.")
+                        .font(Theme.Font.secondary)
+                        .foregroundStyle(.secondary)
+                    Button("Retry") {
+                        stopAuditionIfNeeded()
+                        Task { await store.loadCatalog(forceRefresh: true) }
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
         }
         // The first content in the window now that the header is gone: enough
         // top padding that the field does not crowd the title bar.
@@ -341,13 +370,12 @@ struct AutoEQBrowserView: View {
                 .accessibilityLabel("Preview response curve")
             }
 
-            // A variant with no rig cannot be sent to AutoEQ's equalizer, so
-            // the target choice does not apply to it. Say so rather than
-            // offering a control that would silently do nothing.
             if store.selectedVariant != nil && !store.supportsCustomTargets {
-                Text("This measurement uses AutoEq’s default target.")
-                    .font(Theme.Font.secondary)
-                    .foregroundStyle(.secondary)
+                Text(
+                    "Alternative targets are unavailable until this measurement source grants clear local processing rights. Uses AutoEq’s published correction."
+                )
+                .font(Theme.Font.secondary)
+                .foregroundStyle(.secondary)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -415,22 +443,25 @@ struct AutoEQBrowserView: View {
     }
 
     private var targetControl: some View {
-        let targets = store.availableTargets
-        let isEnabled = !targets.isEmpty && store.supportsCustomTargets
-
-        return PopUpMenuButton {
-            targetMenu()
+        PopUpMenuButton {
+            let menu = NSMenu()
+            for target in store.availableTargets {
+                let item = ActionMenuItem(title: target.label) { [store] in
+                    store.selectTarget(label: target.label)
+                }
+                item.state = target.label == store.selectedTargetLabel ? .on : .off
+                menu.addItem(item)
+            }
+            return menu
         } label: {
             dropdownLabel(
                 store.selectedTargetLabel ?? "Choose a measurement first",
-                isEnabled: isEnabled
-            )
+                isEnabled: !store.availableTargets.isEmpty)
         }
-        .disabled(!isEnabled)
-        .opacity(isEnabled ? 1 : 0.5)
-        .accessibilityElement(children: .combine)
+        .disabled(store.availableTargets.isEmpty)
         .accessibilityLabel("Target curve")
         .accessibilityValue(store.selectedTargetLabel ?? "None")
+        .help("Only targets compatible with this measurement source, rig and form are available.")
     }
 
     /// The control's own face: a filled rounded rect, the selected label, and
@@ -477,18 +508,6 @@ struct AutoEQBrowserView: View {
         return menu
     }
 
-    private func targetMenu() -> NSMenu {
-        let menu = NSMenu()
-        for target in store.availableTargets {
-            let item = ActionMenuItem(title: target.label) { [store] in
-                store.selectTarget(label: target.label)
-            }
-            item.state = target.label == store.selectedTargetLabel ? .on : .off
-            menu.addItem(item)
-        }
-        return menu
-    }
-
     // MARK: - Status
 
     @ViewBuilder
@@ -518,9 +537,12 @@ struct AutoEQBrowserView: View {
                 HStack(spacing: 6) {
                     ProgressView()
                         .controlSize(.small)
-                    Text("Building preview…")
-                        .font(Theme.Font.label)
-                        .foregroundStyle(.secondary)
+                    Text(
+                        store.selectedTargetLabel == AutoEQCatalogParser.defaultTargetLabel
+                            ? "Loading correction…" : "Computing correction locally…"
+                    )
+                    .font(Theme.Font.label)
+                    .foregroundStyle(.secondary)
                 }
             case .ready:
                 Text("Playing preview, \(store.previewProfile?.filters.count ?? 0) filters")
@@ -597,7 +619,7 @@ struct AutoEQBrowserView: View {
 
     /// The line's licence and, once a measurement is chosen, who took it.
     private var attributionCredit: String {
-        var credit = "· MIT, Jaakko Pasanen"
+        var credit = "AutoEq · MIT, Jaakko Pasanen"
         if let source = store.selectedVariant?.sourceDisplayName {
             credit += " · measurement by \(source)"
         }
@@ -647,6 +669,7 @@ struct AutoEQBrowserView: View {
     }
 
     private func cancel() {
+        store.cancelCatalogLoad()
         profileManager.endAudition()
         store.cancelPreview()
         onClose()

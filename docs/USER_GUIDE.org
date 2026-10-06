@@ -105,7 +105,7 @@ included.
 
 * The AutoEq catalog
 
-CoreEQ can fetch a headphone correction straight from [[https://autoeq.app][AutoEq]], without
+CoreEQ can fetch a headphone correction from the [[https://github.com/jaakkopasanen/AutoEq][AutoEq project]], without
 downloading a file by hand. The *AutoEq* button beside the =+= opens the catalog
 sheet directly. For corrections AutoEq computes for a target you choose there,
 use *Import by Hand…* in the sheet's action row: it closes the catalog, opens
@@ -116,25 +116,34 @@ The catalog sheet keeps the equalizer in context while you listen. Type in the
 search field to find a model by name — the catalog holds thousands and matches
 as you type. A model measured more than once says how many measurements it has.
 
-Two menus decide which correction you get:
+The *Measurement source* menu chooses who measured the headphones and how —
+for example Oratory1990 or Rtings. Different measurements give different
+corrections. Crinacle measurements are excluded from this catalog because
+they are not available for redistribution.
 
-- *Measurement source* is who measured the headphones and how — for example
-  Oratory1990, Crinacle, or Rtings. The same model measured on different rigs
-  gives different corrections, so this is a real choice rather than a detail.
-- *Target curve* is the sound the correction aims for — Harman over-ear 2018,
-  Harman in-ear 2019, AutoEq in-ear, and others. Only the targets that apply to
-  the chosen measurement are offered.
+Each measurement uses AutoEq's published, precomputed parametric correction.
+Choose another compatible entry in *Target curve* to compute an alternative
+correction locally. The browser credits Jaakko Pasanen and AutoEq, and names the
+measurement source for the selected profile. *Import by Hand…* remains available
+for corrections created on autoeq.app.
 
-Selecting a model, measurement, or target plays a preview after a short pause,
+Selecting a model or measurement plays a preview after a short pause,
 without saving anything, so you can hear it against your own music. *Cancel*
 puts the previous sound back. *Import* converts the correction and keeps it as
 one of your own presets, named after the model, where it can be edited and
 exported like any other.
 
-The catalog is downloaded once and cached, so browsing stays instant and works
-offline; with no network and no cached copy, the window says so and offers to
-retry. A few measurements were taken without a known rig; for those CoreEQ uses
-AutoEq's own pre-computed correction and its default target, and says so.
+No catalog or profiles are bundled with the app. Opening the AutoEq sheet for
+the first time downloads the catalog and shows a progress bar; Cancel stops
+the download and closes the sheet. Individual corrections download when
+selected and are cached for later offline previews. A correction that has not
+been downloaded still needs a connection; saved presets work independently.
+
+CoreEQ checks for catalog updates when the sheet opens if the cache is at least
+seven days old. The catalog and its profiles use the same Git commit so an
+update cannot mix old and new corrections. If an update fails, CoreEQ keeps
+the saved catalog and offers Retry. With no network and no cached catalog,
+the sheet offers Retry or manual import.
 
 Correction data comes from AutoEq by Jaakko Pasanen, used under the MIT licence;
 each result names the measurement source it came from.

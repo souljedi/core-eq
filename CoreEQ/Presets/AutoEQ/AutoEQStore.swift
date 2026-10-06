@@ -27,8 +27,14 @@ final class AutoEQStore: ObservableObject {
     @Published private(set) var models: [AutoEQModel] = []
     @Published private(set) var targets: [AutoEQTarget] = []
     @Published private(set) var previewProfile: EQProfile?
+    @Published private(set) var catalogProgress: AutoEQCatalogProgress = .checkingRevision
+    @Published private(set) var catalogRevision: String = ""
+    @Published private(set) var catalogIsStale = false
 
-    @Published var searchText: String = ""
+    @Published var searchText: String = "" {
+        didSet { updateSearchResults() }
+    }
+    @Published private(set) var searchResults: [AutoEQModel] = []
     @Published var selectedModelName: String?
     @Published var selectedVariant: AutoEQVariant?
     @Published var selectedTargetLabel: String?
@@ -39,6 +45,8 @@ final class AutoEQStore: ObservableObject {
     /// current selection (or have been explicitly cleared).
     private var previewRequestID = UUID()
     private var previewTask: Task<Void, Never>?
+    private var catalogTask: Task<AutoEQCatalog, any Error>?
+    private var catalogRequestID = UUID()
 
     init(service: AutoEQNetworkService = AutoEQNetworkService()) {
         self.service = service
@@ -47,10 +55,6 @@ final class AutoEQStore: ObservableObject {
     // MARK: - Derived selection
 
     /// Models matching `searchText`, or the first page while the field is empty.
-    var searchResults: [AutoEQModel] {
-        catalog?.models(matching: searchText) ?? []
-    }
-
     var selectedModel: AutoEQModel? {
         guard let selectedModelName else { return nil }
         return models.first { $0.name == selectedModelName }
@@ -60,65 +64,94 @@ final class AutoEQStore: ObservableObject {
         selectedModel?.variants ?? []
     }
 
-    /// Targets the selected variant can be corrected toward, recommended first.
-    ///
-    /// For a variant with no rig — which `/equalize` rejects — the list falls
-    /// back to targets for the same source and form, so the UI can show what
-    /// would apply while still disabling the action via `supportsCustomTargets`.
+    /// Published corrections plus upstream targets compatible with this measurement.
     var availableTargets: [AutoEQTarget] {
         guard let variant = selectedVariant else { return [] }
 
-        func matches(_ target: AutoEQTarget) -> Bool {
-            let pool = target.recommended + target.compatible
-            if variant.rig != nil {
-                return pool.contains {
-                    $0.source == variant.source && $0.form == variant.form
-                        && ($0.rig == nil || $0.rig == variant.rig)
-                }
-            }
-            return pool.contains { $0.source == variant.source && $0.form == variant.form }
+        return targets.filter {
+            $0.supports(source: variant.source, rig: variant.rig, form: variant.form)
         }
-
-        func isRecommended(_ target: AutoEQTarget) -> Bool {
-            if variant.rig != nil {
-                return target.recommended.contains {
-                    $0.source == variant.source && $0.form == variant.form
-                        && ($0.rig == nil || $0.rig == variant.rig)
-                }
-            }
-            return target.recommended.contains {
-                $0.source == variant.source && $0.form == variant.form
-            }
-        }
-
-        let matched = targets.filter(matches)
-        let recommended = matched.filter(isRecommended)
-        let compatible = matched.filter { !isRecommended($0) }
-        return recommended + compatible
     }
 
-    /// Whether the selected variant can use AutoEQ's `/equalize` endpoint. When
-    /// false the UI offers only the pre-computed fallback.
+    /// Whether upstream supplies an alternative target for this measurement.
     var supportsCustomTargets: Bool {
-        selectedVariant?.rig != nil
+        availableTargets.contains { $0.fr != nil }
     }
 
     // MARK: - Loading
 
     func loadCatalog(forceRefresh: Bool = false) async {
+        cancelCatalogLoad()
+        let requestID = UUID()
+        catalogRequestID = requestID
+        catalogProgress = .checkingRevision
         catalogState = .loading
+        let service = service
+        let task = Task {
+            try await service.loadCatalog(forceRefresh: forceRefresh) { [weak self] progress in
+                await self?.updateCatalogProgress(progress, requestID: requestID)
+            }
+        }
+        catalogTask = task
         do {
-            let loaded = try await service.loadCatalog(forceRefresh: forceRefresh)
+            let loaded = try await withTaskCancellationHandler {
+                try await task.value
+            } onCancel: {
+                task.cancel()
+            }
+            guard catalogRequestID == requestID, !Task.isCancelled else { return }
+            cancelPreview()
             catalog = loaded
             models = loaded.models
             targets = loaded.targets
+            updateSearchResults()
+            catalogRevision = loaded.revision
+            catalogIsStale = loaded.isStale
             catalogState = .loaded
+            do {
+                let custom = try await service.loadTargets(revision: loaded.revision)
+                guard catalogRequestID == requestID, !Task.isCancelled else { return }
+                targets += custom
+            } catch {
+                guard catalogRequestID == requestID, !Task.isCancelled else { return }
+                // Published corrections remain available when target metadata is offline.
+            }
         } catch {
-            catalogState = .failed(Self.message(for: error))
+            guard catalogRequestID == requestID else { return }
+            if Task.isCancelled || error is CancellationError
+                || (error as? URLError)?.code == .cancelled
+            {
+                catalogState = catalog == nil ? .idle : .loaded
+            } else {
+                catalogState = .failed(Self.message(for: error))
+            }
         }
+        if catalogRequestID == requestID { catalogTask = nil }
+    }
+
+    func cancelCatalogLoad() {
+        catalogTask?.cancel()
+        catalogTask = nil
+        catalogRequestID = UUID()
+        if catalogState == .loading { catalogState = catalog == nil ? .idle : .loaded }
+    }
+
+    private func updateCatalogProgress(_ progress: AutoEQCatalogProgress, requestID: UUID) {
+        guard requestID == catalogRequestID else { return }
+        catalogProgress = progress
     }
 
     // MARK: - Selection
+
+    /// Starts each presentation in the documented empty state. Kept separate
+    /// from catalog loading so retry and stale refresh preserve in-session work.
+    func resetSelectionForBrowserOpen() {
+        searchText = ""
+        selectedModelName = nil
+        selectedVariant = nil
+        selectedTargetLabel = nil
+        cancelPreview()
+    }
 
     /// Selects a model, its first (highest-priority) variant, and a sensible
     /// default target.
@@ -133,6 +166,7 @@ final class AutoEQStore: ObservableObject {
     /// Selects a variant, re-defaulting the target when the current one does not
     /// apply to it.
     func selectVariant(_ variant: AutoEQVariant) {
+        guard availableVariants.contains(variant) else { return }
         selectedVariant = variant
         if let label = selectedTargetLabel,
             let target = targets.first(where: { $0.label == label }),
@@ -144,6 +178,7 @@ final class AutoEQStore: ObservableObject {
     }
 
     func selectTarget(label: String) {
+        guard availableTargets.contains(where: { $0.label == label }) else { return }
         selectedTargetLabel = label
     }
 
@@ -155,8 +190,13 @@ final class AutoEQStore: ObservableObject {
         let requestID = UUID()
         previewRequestID = requestID
         guard let model = selectedModel, let variant = selectedVariant,
-            let targetLabel = selectedTargetLabel
+            let revision = catalog?.revision
         else {
+            previewState = .idle
+            previewProfile = nil
+            return nil
+        }
+        guard let targetLabel = selectedTargetLabel else {
             previewState = .failed(AutoEQError.noMatchingTarget.localizedDescription)
             previewProfile = nil
             return nil
@@ -166,14 +206,16 @@ final class AutoEQStore: ObservableObject {
         previewState = .loading
         do {
             let profile: EQProfile
-            if variant.rig != nil {
-                let equalized = try await service.equalize(
-                    model: model.name, variant: variant, targetLabel: targetLabel)
+            if targetLabel != AutoEQCatalogParser.defaultTargetLabel,
+                let target = availableTargets.first(where: { $0.label == targetLabel })
+            {
+                let computed = try await service.computeProfile(
+                    model: model.name, variant: variant, target: target, revision: revision)
                 profile = try AutoEQProfileBuilder.makeProfile(
-                    model: model.name, equalized: equalized)
+                    model: model.name + " · " + targetLabel, equalized: computed)
             } else {
                 let text = try await service.fetchPrecomputedParametricEQ(
-                    model: model.name, source: variant.source, form: variant.form)
+                    model: model.name, variant: variant, revision: revision)
                 profile = try AutoEQProfileBuilder.makeProfile(
                     model: model.name, parametricEQText: text)
             }
@@ -181,7 +223,8 @@ final class AutoEQStore: ObservableObject {
                 previewRequestID == requestID,
                 selectedModelName == model.name,
                 selectedVariant == variant,
-                selectedTargetLabel == targetLabel
+                selectedTargetLabel == targetLabel,
+                catalog?.revision == revision
             else { return nil }
             previewProfile = profile
             previewState = .ready
@@ -209,14 +252,6 @@ final class AutoEQStore: ObservableObject {
         }
     }
 
-    func clearPreview() {
-        previewTask?.cancel()
-        previewTask = nil
-        previewRequestID = UUID()
-        previewProfile = nil
-        previewState = .idle
-    }
-
     func cancelPreview() {
         previewTask?.cancel()
         previewTask = nil
@@ -227,20 +262,15 @@ final class AutoEQStore: ObservableObject {
 
     // MARK: - Helpers
 
-    /// The first recommended target for a variant, or the first compatible one.
+    /// The target supplied with the published correction.
     private func defaultTargetLabel(for variant: AutoEQVariant) -> String? {
-        func matches(_ candidate: AutoEQTargetVariant) -> Bool {
-            guard candidate.source == variant.source && candidate.form == variant.form else {
-                return false
-            }
-            // A blank rig in the target data is a form-wide entry, so it applies
-            // to any rigged variant of that source and form.
-            if variant.rig == nil { return candidate.rig == nil }
-            return candidate.rig == nil || candidate.rig == variant.rig
-        }
-        let recommended = targets.first { $0.recommended.contains(where: matches) }
-        let compatible = targets.first { $0.compatible.contains(where: matches) }
-        return (recommended ?? compatible)?.label
+        targets.first {
+            $0.supports(source: variant.source, rig: variant.rig, form: variant.form)
+        }?.label
+    }
+
+    private func updateSearchResults() {
+        searchResults = catalog?.models(matching: searchText) ?? []
     }
 
     private static func message(for error: any Error) -> String {

@@ -1,75 +1,24 @@
 import Foundation
 
-/// Inline AutoEQ payloads and small helpers for the AutoEQ tests. The shapes
-/// mirror the live endpoints at a scale the tests can reason about.
 enum AutoEQTestFixtures {
-    /// Three models: one with a single `nil`-rig variant, one with two variants,
-    /// and one whose name carries a diacritic.
-    static let entriesJSON = """
-        {
-          "Zeta Headphones": [
-            {"source": "oratory1990", "rig": null, "form": "over-ear"}
-          ],
-          "Alpha Headphones": [
-            {"source": "oratory1990", "rig": "GRAS 43AG-7", "form": "over-ear"},
-            {"source": "crinacle", "rig": null, "form": "in-ear"}
-          ],
-          "Café Audio": [
-            {"source": "crinacle", "rig": "IEC60318-4", "form": "in-ear"}
-          ]
-        }
+    static let revision = String(repeating: "a", count: 40)
+    static let nextRevision = String(repeating: "b", count: 40)
+    static let index = """
+        # Index
+        - [Zeta Headphones](./oratory1990/over-ear/Zeta%20Headphones) by oratory1990
+        - [Alpha Headphones](./oratory1990/GRAS%2043AG-7%20over-ear/Alpha%20Headphones) by oratory1990 on GRAS 43AG-7
+        - [Alpha Headphones](./Rtings/HMS%20II.3%20over-ear/Alpha%20Headphones) by Rtings on HMS II.3
+        - [Alpha Headphones](./crinacle/711%20in-ear/Alpha%20Headphones) by crinacle on 711
+        - [Café Audio](./Super%20Review/in-ear/Caf%C3%A9%20Audio) by Super Review
+        - [Excluded](./Crinacle/711%20in-ear/Excluded) by Crinacle
+        """
+    static var indexData: Data { Data(index.utf8) }
+    static let profileText = """
+        Preamp: -6.0 dB
+        Filter 1: ON PK Fc 1000 Hz Gain 3.0 dB Q 1.41
+        Filter 2: ON LSC Fc 105 Hz Gain 5.0 dB Q 0.70
         """
 
-    /// Over-ear targets that recommend and merely tolerate `Alpha Headphones`'
-    /// GRAS variant, plus an in-ear target for its crinacle variant.
-    static let targetsJSON = """
-        [
-          {
-            "label": "Harman over-ear 2018",
-            "compatible": [
-              {"source": "oratory1990", "rig": "GRAS 43AG-7", "form": "over-ear"}
-            ],
-            "recommended": [],
-            "bassBoost": {"gain": 0}
-          },
-          {
-            "label": "Harman in-ear 2019",
-            "compatible": [],
-            "recommended": [
-              {"source": "crinacle", "rig": null, "form": "in-ear"}
-            ],
-            "bassBoost": {}
-          },
-          {
-            "label": "Harman over-ear 2013",
-            "compatible": [
-              {"source": "oratory1990", "rig": "GRAS 43AG-7", "form": "over-ear"}
-            ],
-            "recommended": [
-              {"source": "oratory1990", "rig": "GRAS 43AG-7", "form": "over-ear"}
-            ],
-            "bassBoost": {}
-          }
-        ]
-        """
-
-    static let equalizeJSON = """
-        {
-          "parametric_eq": {
-            "preamp": -6.0,
-            "filters": [
-              {"type": "PEAKING", "fc": 105.0, "q": 1.41, "gain": 3.0},
-              {"type": "LOW_SHELF", "fc": 105.0, "q": 0.70, "gain": 5.0}
-            ]
-          },
-          "fr": {}
-        }
-        """
-
-    static var entriesData: Data { Data(entriesJSON.utf8) }
-    static var targetsData: Data { Data(targetsJSON.utf8) }
-
-    /// A unique, empty cache directory removed when `remove` is called.
     static func makeCacheDirectory() -> URL {
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("coreeq-autoeq-\(UUID().uuidString)", isDirectory: true)
@@ -81,24 +30,43 @@ enum AutoEQTestFixtures {
         try? FileManager.default.removeItem(at: directory)
     }
 
-    /// Writes both cache files, optionally dating them into the past.
     static func writeCache(
-        into directory: URL, entries: Data = entriesData, targets: Data = targetsData,
-        modified: Date? = nil
-    ) {
-        let entriesURL = directory.appendingPathComponent("entries.json")
-        let targetsURL = directory.appendingPathComponent("targets.json")
-        try? entries.write(to: entriesURL, options: .atomic)
-        try? targets.write(to: targetsURL, options: .atomic)
-        guard let modified else { return }
-        for url in [entriesURL, targetsURL] {
-            try? FileManager.default.setAttributes(
-                [.modificationDate: modified], ofItemAtPath: url.path)
+        into directory: URL, revision: String = revision, index: Data = indexData,
+        checkedAt: Date = Date(), version: Int = 1
+    ) throws {
+        let value = Snapshot(
+            version: version, revision: revision, checkedAt: checkedAt, index: index)
+        try JSONEncoder().encode(value).write(
+            to: directory.appendingPathComponent("catalog-v1.json"), options: .atomic)
+    }
+
+    static func catalogHandler(revision: String = revision, index: Data = indexData) -> StubHandler
+    {
+        { request in
+            let url = request.url!
+            if url == AutoEQNetworkService.revisionURL {
+                return (httpResponse(url: url), Data("{\"sha\":\"\(revision)\"}".utf8))
+            }
+            if url.path.hasSuffix("/INDEX.md") {
+                return (
+                    httpResponse(url: url, headers: ["Content-Length": "\(index.count)"]), index
+                )
+            }
+            if url.path.hasSuffix(" ParametricEQ.txt") {
+                return (httpResponse(url: url), Data(profileText.utf8))
+            }
+            throw URLError(.badURL)
         }
+    }
+
+    private struct Snapshot: Codable {
+        let version: Int
+        let revision: String
+        let checkedAt: Date
+        let index: Data
     }
 }
 
-/// A canned HTTP response for `StubURLProtocol`.
 func httpResponse(
     url: URL, status: Int = 200, headers: [String: String] = ["Content-Type": "application/json"]
 ) -> HTTPURLResponse {

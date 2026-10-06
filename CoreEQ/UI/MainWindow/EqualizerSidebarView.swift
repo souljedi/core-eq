@@ -19,7 +19,6 @@ struct EqualizerSidebarView: View {
     /// The catalog's request to show the by-hand guide here. The catalog closes
     /// itself and taps this instead of presenting the guide, because the paste
     /// it starts ends in a preset this list owns.
-    @ObservedObject private var guideRoute = AutoEQGuideRoute.shared
     @ObservedObject private var autoEQRoute = AutoEQBrowserRoute.shared
 
     /// Filters the list. Empty means everything, in sections.
@@ -51,6 +50,7 @@ struct EqualizerSidebarView: View {
     /// Controls visibility of the AutoEQ guide sheet.
     @State private var showingAutoEQGuide = false
     @State private var showingAutoEQBrowser = false
+    @State private var showGuideAfterBrowser = false
     /// Set by the guide's Paste button: the clipboard is read once the sheet
     /// has gone.
     @State private var pasteAfterGuide = false
@@ -181,17 +181,21 @@ struct EqualizerSidebarView: View {
                 showingAutoEQGuide = false
             }
         }
-        .onChange(of: guideRoute.request) { _, _ in showingAutoEQGuide = true }
-        .sheet(isPresented: $showingAutoEQBrowser) {
+        .sheet(
+            isPresented: $showingAutoEQBrowser,
+            onDismiss: {
+                guard showGuideAfterBrowser else { return }
+                showGuideAfterBrowser = false
+                showingAutoEQGuide = true
+            }
+        ) {
             AutoEQBrowserView(
                 store: autoEQStore,
                 profileManager: profileManager,
                 onClose: { showingAutoEQBrowser = false },
                 onImportByHand: {
+                    showGuideAfterBrowser = true
                     showingAutoEQBrowser = false
-                    DispatchQueue.main.async {
-                        AutoEQGuideRoute.shared.requestGuide()
-                    }
                 }
             )
         }

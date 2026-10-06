@@ -1,22 +1,38 @@
+import CryptoKit
 import Foundation
 
-/// Fetches the AutoEQ catalog and computes corrections, caching the catalog on
-/// disk so browsing works offline.
-///
-/// An actor because the cache and the catalogue it guards are shared across the
-/// UI's tasks; the network and file work are the reason the methods are async
-/// at all. There is no other concurrency in the app.
-actor AutoEQNetworkService {
-    static let entriesURL = URL(string: "https://autoeq.app/entries")!
-    static let targetsURL = URL(string: "https://autoeq.app/targets")!
-    static let equalizeURL = URL(string: "https://autoeq.app/equalize")!
+enum AutoEQCatalogProgress: Sendable, Equatable {
+    case checkingRevision
+    case downloading(received: Int, total: Int?)
+    case preparing
 
-    /// How long a cached catalog is trusted before a refresh is attempted.
-    private static let cacheMaxAge: TimeInterval = 7 * 24 * 60 * 60
+    var fraction: Double? {
+        guard case .downloading(let received, let total) = self, let total, total > 0 else {
+            return nil
+        }
+        return min(Double(received) / Double(total), 1)
+    }
+
+    var message: String {
+        switch self {
+        case .checkingRevision: return "Checking for AutoEq updates…"
+        case .downloading: return "Downloading the AutoEq catalog…"
+        case .preparing: return "Preparing the AutoEq catalog…"
+        }
+    }
+}
+
+/// Downloads published AutoEq results from an immutable GitHub revision.
+/// Construction performs no I/O; the browser starts the first download.
+actor AutoEQNetworkService {
+    static let revisionURL = URL(
+        string: "https://api.github.com/repos/jaakkopasanen/AutoEq/commits/master")!
+    static let cacheMaxAge: TimeInterval = 7 * 24 * 60 * 60
+    static let cacheVersion = 1
 
     private let session: URLSession
     private let cacheDirectory: URL
-    private var equalizedProfiles: [EqualizeCacheKey: AutoEQEqualizedProfile] = [:]
+    private var snapshot: CatalogSnapshot?
 
     static var userAgent: String {
         let version =
@@ -24,270 +40,267 @@ actor AutoEQNetworkService {
         return "CoreEQ/\(version ?? "development")"
     }
 
-    private var entriesFileURL: URL { cacheDirectory.appendingPathComponent("entries.json") }
-    private var targetsFileURL: URL { cacheDirectory.appendingPathComponent("targets.json") }
-
-    /// - Parameters:
-    ///   - session: the session to fetch with; injectable so tests can stub the
-    ///     network with a `URLProtocol`.
-    ///   - cacheDirectory: where the catalog is cached. Defaults to
-    ///     `Caches/<bundle id>/AutoEQ`.
     init(session: URLSession = .shared, cacheDirectory: URL? = nil) {
         self.session = session
         self.cacheDirectory = cacheDirectory ?? Self.defaultCacheDirectory()
     }
 
-    // MARK: - Catalog
-
-    /// Returns the catalog, from cache when it is recent enough.
-    ///
-    /// When the network fails, a stale cache is better than nothing and is
-    /// returned instead of an error; only with no cache at all does this throw.
-    func loadCatalog(forceRefresh: Bool = false) async throws -> AutoEQCatalog {
-        if !forceRefresh, let fresh = cachedCatalogIfFresh() {
-            return fresh
+    /// Check weekly or on an explicit refresh. Failed updates retain the last
+    /// complete snapshot; cancellation never becomes an offline result.
+    func loadCatalog(
+        forceRefresh: Bool = false,
+        progress: @Sendable (AutoEQCatalogProgress) async -> Void = { _ in }
+    ) async throws -> AutoEQCatalog {
+        try Task.checkCancellation()
+        let cached = snapshot ?? readSnapshot()
+        if !forceRefresh, let cached, cached.isFresh {
+            snapshot = cached
+            return try cached.catalog()
         }
-
         do {
-            return try await fetchAndCacheCatalog()
-        } catch {
-            if let stale = readCachedCatalog() {
-                return stale
+            await progress(.checkingRevision)
+            let data = try await fetchData(from: Self.revisionURL)
+            let revision = try JSONDecoder().decode(Revision.self, from: data).sha
+            guard Self.isRevision(revision) else { throw AutoEQError.malformedData }
+            let index: Data
+            if let cached, cached.revision == revision {
+                index = cached.index
+            } else {
+                index = try await downloadIndex(revision: revision, progress: progress)
             }
+            await progress(.preparing)
+            let updated = CatalogSnapshot(
+                version: Self.cacheVersion, revision: revision, checkedAt: Date(), index: index)
+            let catalog = try updated.catalog()
+            try Task.checkCancellation()
+            snapshot = updated
+            writeSnapshot(updated)
+            return catalog
+        } catch {
+            try Task.checkCancellation()
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                throw error
+            }
+            if let cached {
+                snapshot = cached
+                return try cached.catalog(isStale: true)
+            }
+            if error is AutoEQError { throw error }
+            if error is DecodingError { throw AutoEQError.malformedData }
             throw AutoEQError.offline
         }
     }
 
-    // MARK: - Equalize
-
-    /// Computes AutoEQ's parametric correction for one variant toward one target.
-    ///
-    /// - Throws: `AutoEQError.unsupportedVariant` for a variant with no rig,
-    ///   which `/equalize` cannot process. Callers should fall back to
-    ///   `fetchPrecomputedParametricEQ`.
-    func equalize(
-        model: String, variant: AutoEQVariant, targetLabel: String, bassBoostGain: Double = 0
-    ) async throws -> AutoEQEqualizedProfile {
-        guard variant.rig != nil else { throw AutoEQError.unsupportedVariant }
-
-        try Task.checkCancellation()
-        let cacheKey = EqualizeCacheKey(
-            model: model,
-            source: variant.source,
-            rig: variant.rig,
-            target: targetLabel)
-        if let cached = equalizedProfiles[cacheKey] {
-            return cached
-        }
-
-        let body = EqualizeRequest(
-            name: model,
-            source: variant.source,
-            rig: variant.rig,
-            target: targetLabel,
-            bassBoostGain: bassBoostGain,
-            parametricEQ: true,
-            parametricEQConfig: "8_PEAKING_WITH_SHELVES",
-            response: EmptyResponse())
-
-        var request = URLRequest(url: Self.equalizeURL)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-        do {
-            request.httpBody = try JSONEncoder().encode(body)
-        } catch {
-            throw AutoEQError.malformedData
-        }
-
-        let (data, response) = try await session.data(for: request)
-        try Task.checkCancellation()
-        guard let http = response as? HTTPURLResponse else {
-            throw AutoEQError.invalidResponse
-        }
-        guard http.statusCode == 200 else {
-            throw AutoEQError.httpStatus(http.statusCode)
-        }
-
-        let decoded: EqualizeResponse
-        do {
-            decoded = try JSONDecoder().decode(EqualizeResponse.self, from: data)
-        } catch {
-            throw AutoEQError.malformedData
-        }
-        let profile = AutoEQEqualizedProfile(
-            filters: decoded.parametricEQ.filters.map {
-                AutoEQEqualizedFilter(type: $0.type, fc: $0.fc, q: $0.q, gain: $0.gain)
-            },
-            preamp: decoded.parametricEQ.preamp)
-        equalizedProfiles[cacheKey] = profile
-        return profile
-    }
-
-    /// Fetches AutoEQ's pre-computed parametric EQ text, the fallback for
-    /// variants that `/equalize` rejects.
+    /// Profiles are cached by commit and exact result path. Updating the
+    /// catalog cannot accidentally reuse a correction from an older revision.
     func fetchPrecomputedParametricEQ(
-        model: String, source: String, form: String
-    ) async throws
-        -> String
-    {
-        guard let url = Self.precomputedParametricEQURL(model: model, source: source, form: form)
-        else {
-            throw AutoEQError.invalidResponse
+        model: String, variant: AutoEQVariant, revision: String
+    ) async throws -> String {
+        try Task.checkCancellation()
+        guard Self.isRevision(revision), let path = variant.resultPath,
+            let parts = AutoEQCatalogParser.resultComponents(path),
+            parts[0] == variant.source, parts[2] == model
+        else { throw AutoEQError.unsupportedVariant }
+        let relativePath = path + "/" + model + " ParametricEQ.txt"
+        let digest = SHA256.hash(data: Data(relativePath.utf8))
+            .map { String(format: "%02x", $0) }.joined()
+        let directory = cacheDirectory.appendingPathComponent("profiles").appendingPathComponent(
+            revision)
+        let file = directory.appendingPathComponent(digest + ".txt")
+        if let data = try? Data(contentsOf: file),
+            let text = try? Self.profileText(data, model: model)
+        {
+            return text
         }
-        let data = try await fetchData(from: url)
-        guard let text = String(data: data, encoding: .utf8) else {
-            throw AutoEQError.malformedData
-        }
+        let data = try await fetchData(from: Self.resultURL(revision: revision, path: relativePath))
+        let text = try Self.profileText(data, model: model)
+        try Task.checkCancellation()
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? data.write(to: file, options: .atomic)
         return text
     }
 
-    // MARK: - URL construction
-
-    /// The jsDelivr URL for a pre-computed parametric EQ file. Exposed for
-    /// tests; each path component is percent-encoded so `&` survives and spaces
-    /// become `%20`.
-    static func precomputedParametricEQURL(model: String, source: String, form: String) -> URL? {
-        let allowed = CharacterSet.urlPathAllowed.subtracting(CharacterSet(charactersIn: "/"))
-        func encode(_ value: String) -> String {
-            value.addingPercentEncoding(withAllowedCharacters: allowed) ?? value
-        }
-        let filename = "\(model) ParametricEQ.txt"
-        let path =
-            "https://cdn.jsdelivr.net/gh/jaakkopasanen/AutoEq@master/results/"
-            + "\(encode(source))/\(encode(form))/\(encode(model))/\(encode(filename))"
-        return URL(string: path)
+    func loadTargets(revision: String) async throws -> [AutoEQTarget] {
+        guard Self.isRevision(revision) else { throw AutoEQError.malformedData }
+        let data = try await cachedInput(revision: revision, path: "webapp/data/targets.json")
+        let targets = try JSONDecoder().decode([AutoEQTarget].self, from: data)
+        return targets.filter { $0.fr?.isValid == true }
     }
 
-    // MARK: - Networking
+    func computeProfile(
+        model: String, variant: AutoEQVariant, target: AutoEQTarget,
+        revision: String
+    ) async throws -> AutoEQEqualizedProfile {
+        guard Self.isRevision(revision), let path = variant.resultPath,
+            let parts = AutoEQCatalogParser.resultComponents(path), parts[0] == variant.source,
+            parts[2] == model,
+            target.supports(source: variant.source, rig: variant.rig, form: variant.form)
+        else { throw AutoEQError.unsupportedVariant }
+        let data = try await cachedInput(
+            revision: revision, path: "results/" + path + "/" + model + ".csv")
+        let curve = try AutoEQCurve.csv(data)
+        var identity = Data("\(revision):\(path)".utf8)
+        identity.append(data)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        identity.append(try encoder.encode(target))
+        let digest = SHA256.hash(data: identity).map { String(format: "%02x", $0) }.joined()
+        let directory = cacheDirectory.appendingPathComponent(
+            "computed-v\(AutoEQLocalSolver.version)")
+        let file = directory.appendingPathComponent(digest + ".json")
+        if let cached = try? Data(contentsOf: file),
+            let profile = try? JSONDecoder().decode(AutoEQEqualizedProfile.self, from: cached),
+            profile.preamp.isFinite, profile.filters.count == AutoEQLocalSolver.filterCount,
+            profile.filters.allSatisfy({ $0.fc.isFinite && $0.q.isFinite && $0.gain.isFinite })
+        {
+            try Task.checkCancellation()
+            return profile
+        }
+        let worker = Task.detached(priority: .userInitiated) {
+            try AutoEQLocalSolver.compute(measurement: curve, target: target)
+        }
+        let profile = try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
+        try Task.checkCancellation()
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? JSONEncoder().encode(profile).write(to: file, options: .atomic)
+        return profile
+    }
 
-    /// Fetches data from a URL, validating HTTP 200.
-    ///
-    /// `nonisolated` so the two catalog requests can run concurrently.
-    private nonisolated func fetchData(from url: URL) async throws -> Data {
-        var request = URLRequest(url: url)
-        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse else {
-            throw AutoEQError.invalidResponse
+    private func cachedInput(revision: String, path: String) async throws -> Data {
+        try Task.checkCancellation()
+        let digest = SHA256.hash(data: Data(path.utf8)).map { String(format: "%02x", $0) }.joined()
+        let directory = cacheDirectory.appendingPathComponent("inputs").appendingPathComponent(
+            revision)
+        let file = directory.appendingPathComponent(digest)
+        if let data = try? Data(contentsOf: file) { return data }
+        let data = try await fetchData(from: Self.repositoryURL(revision: revision, path: path))
+        if path.hasSuffix(".csv") {
+            _ = try AutoEQCurve.csv(data)
+        } else {
+            let targets = try JSONDecoder().decode([AutoEQTarget].self, from: data)
+            guard targets.contains(where: { $0.fr?.isValid == true }) else {
+                throw AutoEQError.malformedData
+            }
         }
-        guard http.statusCode == 200 else {
-            throw AutoEQError.httpStatus(http.statusCode)
-        }
+        try Task.checkCancellation()
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? data.write(to: file, options: .atomic)
         return data
     }
 
-    private func fetchAndCacheCatalog() async throws -> AutoEQCatalog {
-        async let entriesData = fetchData(from: Self.entriesURL)
-        async let targetsData = fetchData(from: Self.targetsURL)
-        let (entries, targets) = try await (entriesData, targetsData)
-
-        let models = try AutoEQCatalogParser.parseEntries(entries)
-        let parsedTargets = try AutoEQCatalogParser.parseTargets(targets)
-        guard !models.isEmpty else { throw AutoEQError.emptyCatalog }
-
-        writeCache(entries: entries, targets: targets)
-        return AutoEQCatalog(models: models, targets: parsedTargets)
+    static func isRevision(_ revision: String) -> Bool {
+        revision.count == 40 && revision.allSatisfy { "0123456789abcdef".contains($0) }
     }
 
-    // MARK: - Cache
-
-    private func cachedCatalogIfFresh() -> AutoEQCatalog? {
-        guard isFresh(entriesFileURL), isFresh(targetsFileURL) else { return nil }
-        return readCachedCatalog()
+    static func resultURL(revision: String, path: String) -> URL {
+        repositoryURL(revision: revision, path: "results/" + path)
     }
 
-    private func isFresh(_ url: URL) -> Bool {
-        guard
-            let modified = try? url.resourceValues(forKeys: [.contentModificationDateKey])
-                .contentModificationDate
-        else {
-            return false
+    private static func repositoryURL(revision: String, path: String) -> URL {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        let encoded = path.components(separatedBy: "/").map {
+            $0.addingPercentEncoding(withAllowedCharacters: allowed)!
+        }.joined(separator: "/")
+        return URL(
+            string:
+                "https://raw.githubusercontent.com/jaakkopasanen/AutoEq/\(revision)/\(encoded)"
+        )!
+    }
+
+    private static func profileText(_ data: Data, model: String) throws -> String {
+        guard let text = String(data: data, encoding: .utf8) else {
+            throw AutoEQError.malformedData
         }
-        return Date().timeIntervalSince(modified) < Self.cacheMaxAge
+        // A 200 response containing an error page must not poison offline previews.
+        _ = try AutoEQProfileBuilder.makeProfile(model: model, parametricEQText: text)
+        return text
     }
 
-    /// Reads and parses both cache files, or `nil` if either is missing or
-    /// damaged — a broken cache is simply a cache miss.
-    private func readCachedCatalog() -> AutoEQCatalog? {
-        guard let entries = try? Data(contentsOf: entriesFileURL),
-            let targets = try? Data(contentsOf: targetsFileURL),
-            let models = try? AutoEQCatalogParser.parseEntries(entries),
-            let parsedTargets = try? AutoEQCatalogParser.parseTargets(targets),
-            !models.isEmpty
-        else {
-            return nil
+    private func request(for url: URL) -> URLRequest {
+        var request = URLRequest(
+            url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
+        request.setValue(Self.userAgent, forHTTPHeaderField: "User-Agent")
+        return request
+    }
+
+    private func validate(_ response: URLResponse) throws {
+        guard let http = response as? HTTPURLResponse else { throw AutoEQError.invalidResponse }
+        guard http.statusCode == 200 else { throw AutoEQError.httpStatus(http.statusCode) }
+    }
+
+    private func fetchData(from url: URL) async throws -> Data {
+        let (data, response) = try await session.data(for: request(for: url))
+        try Task.checkCancellation()
+        try validate(response)
+        return data
+    }
+
+    private func downloadIndex(
+        revision: String, progress: @Sendable (AutoEQCatalogProgress) async -> Void
+    ) async throws -> Data {
+        let url = Self.resultURL(revision: revision, path: "INDEX.md")
+        let (bytes, response) = try await session.bytes(for: request(for: url))
+        try validate(response)
+        let total = response.expectedContentLength > 0 ? Int(response.expectedContentLength) : nil
+        var data = Data()
+        await progress(.downloading(received: 0, total: total))
+        for try await byte in bytes {
+            data.append(byte)
+            if data.count.isMultiple(of: 32_768) {
+                try Task.checkCancellation()
+                await progress(.downloading(received: data.count, total: total))
+            }
         }
-        return AutoEQCatalog(models: models, targets: parsedTargets)
+        try Task.checkCancellation()
+        await progress(.downloading(received: data.count, total: total))
+        return data
     }
 
-    /// Writes both files atomically. Failures are ignored on purpose: a cache
-    /// that cannot be written is a performance problem, never a correctness one,
-    /// and must not take the app down.
-    private func writeCache(entries: Data, targets: Data) {
+    private var snapshotURL: URL { cacheDirectory.appendingPathComponent("catalog-v1.json") }
+
+    private func readSnapshot() -> CatalogSnapshot? {
+        guard let data = try? Data(contentsOf: snapshotURL),
+            let cached = try? JSONDecoder().decode(CatalogSnapshot.self, from: data),
+            cached.version == Self.cacheVersion, Self.isRevision(cached.revision),
+            (try? cached.catalog()) != nil
+        else { return nil }
+        return cached
+    }
+
+    private func writeSnapshot(_ value: CatalogSnapshot) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
         try? FileManager.default.createDirectory(
             at: cacheDirectory, withIntermediateDirectories: true)
-        try? entries.write(to: entriesFileURL, options: .atomic)
-        try? targets.write(to: targetsFileURL, options: .atomic)
+        try? data.write(to: snapshotURL, options: .atomic)
     }
 
     private static func defaultCacheDirectory() -> URL {
         let base =
             FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
-        let identifier = Bundle.main.bundleIdentifier ?? "CoreEQ"
-        return base.appendingPathComponent(identifier).appendingPathComponent("AutoEQ")
+        return base.appendingPathComponent(Bundle.main.bundleIdentifier ?? "CoreEQ")
+            .appendingPathComponent("AutoEQ")
     }
 }
 
-private struct EqualizeCacheKey: Hashable {
-    let model: String
-    let source: String
-    let rig: String?
-    let target: String
-}
+private struct Revision: Decodable { let sha: String }
 
-// MARK: - Wire types
+private struct CatalogSnapshot: Codable {
+    let version: Int
+    let revision: String
+    let checkedAt: Date
+    let index: Data
 
-/// The `/equalize` request body. Field names match the endpoint, which is why
-/// they differ from Swift's naming.
-private struct EqualizeRequest: Encodable {
-    let name: String
-    let source: String
-    let rig: String?
-    let target: String
-    let bassBoostGain: Double
-    let parametricEQ: Bool
-    let parametricEQConfig: String
-    let response: EmptyResponse
-
-    enum CodingKeys: String, CodingKey {
-        case name, source, rig, target, response
-        case bassBoostGain = "bass_boost_gain"
-        case parametricEQ = "parametric_eq"
-        case parametricEQConfig = "parametric_eq_config"
+    var isFresh: Bool {
+        let age = Date().timeIntervalSince(checkedAt)
+        return age >= 0 && age < AutoEQNetworkService.cacheMaxAge
     }
-}
 
-/// Serializes to `{}`, the `response` field `/equalize` expects.
-private struct EmptyResponse: Codable {}
-
-private struct EqualizeResponse: Decodable {
-    let parametricEQ: EqualizedBody
-
-    enum CodingKeys: String, CodingKey {
-        case parametricEQ = "parametric_eq"
+    func catalog(isStale: Bool = false) throws -> AutoEQCatalog {
+        try AutoEQCatalogParser.parseIndex(index, revision: revision, isStale: isStale)
     }
-}
-
-private struct EqualizedBody: Decodable {
-    let preamp: Double
-    let filters: [FilterBody]
-}
-
-private struct FilterBody: Decodable {
-    let type: String
-    let fc: Double
-    let q: Double
-    let gain: Double
 }

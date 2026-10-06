@@ -3,20 +3,18 @@ import Foundation
 /// One measurement variant of a headphone, as AutoEQ publishes it.
 ///
 /// A model is measured by several sources on several rigs and in several
-/// form factors, and each combination is a separate correction. `source` names
-/// the measurement database (`oratory1990`, `crinacle`, …), `form` the shape
-/// (`over-ear`, `in-ear`, …), and `rig` the fixture used — which is `nil` for
-/// roughly ten models whose measurements carry no rig and so cannot be sent to
-/// AutoEQ's `/equalize` endpoint.
+/// form factors, and each combination is a separate correction. The result
+/// path preserves the exact upstream directory, including spaces and case.
 struct AutoEQVariant: Sendable, Hashable, Codable {
     var source: String
     var rig: String?
     var form: String
+    var resultPath: String? = nil
 
     /// A human-friendly label for menus, e.g. `Oratory1990 · over-ear
     /// (GRAS 43AG-7)`.
     ///
-    /// AutoEQ's own identifiers are lowercase slugs; the source is title-cased
+    /// The source is title-cased
     /// because it is a proper name, while `form` and `rig` are left as
     /// published so they read as the measurement labels they are.
     var displayName: String {
@@ -58,11 +56,10 @@ struct AutoEQModel: Sendable, Hashable, Identifiable {
     var id: String { name }
 }
 
-/// One measurement variant a target accepts, as returned by `/targets`.
+/// One measurement variant a target accepts.
 ///
 /// The shape deliberately mirrors `AutoEQVariant` so membership can be tested
-/// field by field; it is a separate type because a target's lists are decoded
-/// from AutoEQ and never shown on their own.
+/// field by field; a target's lists are never shown on their own.
 struct AutoEQTargetVariant: Sendable, Hashable, Codable {
     var source: String
     var rig: String?
@@ -70,15 +67,18 @@ struct AutoEQTargetVariant: Sendable, Hashable, Codable {
 }
 
 /// A correction target — Harman, diffuse field, and the like.
-struct AutoEQTarget: Sendable, Hashable, Identifiable, Decodable {
+struct AutoEQTarget: Sendable, Hashable, Identifiable, Codable {
     var label: String
     var compatible: [AutoEQTargetVariant]
     var recommended: [AutoEQTargetVariant]
 
+    var fr: AutoEQCurve? = nil
+    var bassBoost: AutoEQBassBoost? = nil
+
     var id: String { label }
 
     /// Whether this target can be applied to a measurement with the given
-    /// provenance. AutoEQ only accepts a target that lists the variant in
+    /// provenance. A target lists the variant in
     /// `compatible` or `recommended`.
     func supports(source: String, rig: String?, form: String) -> Bool {
         matches(compatible, source: source, rig: rig, form: form)
@@ -99,7 +99,7 @@ struct AutoEQTarget: Sendable, Hashable, Identifiable, Decodable {
 }
 
 /// A single biquad in an equalized profile, as AutoEQ returns it.
-struct AutoEQEqualizedFilter: Sendable, Hashable {
+struct AutoEQEqualizedFilter: Sendable, Hashable, Codable {
     var type: String
     var fc: Double
     var q: Double
@@ -107,7 +107,7 @@ struct AutoEQEqualizedFilter: Sendable, Hashable {
 }
 
 /// AutoEQ's computed parametric equalization for one model, variant, and target.
-struct AutoEQEqualizedProfile: Sendable, Hashable {
+struct AutoEQEqualizedProfile: Sendable, Hashable, Codable {
     var filters: [AutoEQEqualizedFilter]
     var preamp: Double
 }
@@ -117,12 +117,14 @@ struct AutoEQEqualizedProfile: Sendable, Hashable {
 struct AutoEQCatalog: Sendable {
     var models: [AutoEQModel]
     var targets: [AutoEQTarget]
+    var revision: String
+    var isStale: Bool = false
 
     /// Models whose full name contains `query`, case- and diacritic-insensitively.
     ///
     /// An empty query is a browse rather than a search and returns the first
     /// `limit` models in catalog order, which keeps the unfiltered list usable
-    /// without materializing all six thousand rows.
+    /// without materializing thousands of rows.
     func models(matching query: String, limit: Int = 300) -> [AutoEQModel] {
         guard limit > 0 else { return [] }
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -153,7 +155,7 @@ enum AutoEQError: Error, LocalizedError, Equatable, Sendable {
     case emptyCatalog
     /// No target is applicable to the chosen model variant.
     case noMatchingTarget
-    /// The variant cannot be equalized by AutoEQ (a `nil` rig).
+    /// The variant has no supported published result path.
     case unsupportedVariant
     /// JSON could not be decoded.
     case malformedData
@@ -163,9 +165,11 @@ enum AutoEQError: Error, LocalizedError, Equatable, Sendable {
     var errorDescription: String? {
         switch self {
         case .offline:
-            return "AutoEq could not be reached."
+            return "Couldn’t download AutoEq data from GitHub. Check your connection and retry."
         case .httpStatus(let code):
-            return "AutoEq replied with status \(code)."
+            return code == 403 || code == 429
+                ? "GitHub is limiting downloads. Try again later."
+                : "Couldn’t download AutoEq data (HTTP \(code)). Try again."
         case .invalidResponse:
             return "AutoEq replied with an unexpected response."
         case .emptyCatalog:
@@ -173,7 +177,7 @@ enum AutoEQError: Error, LocalizedError, Equatable, Sendable {
         case .noMatchingTarget:
             return "No correction target matches this headphone."
         case .unsupportedVariant:
-            return "AutoEq cannot equalize this measurement."
+            return "No supported published correction is available for this measurement."
         case .malformedData:
             return "AutoEq returned data CoreEQ could not read."
         case .unsupportedFilter(let type):
@@ -190,7 +194,7 @@ enum AutoEQError: Error, LocalizedError, Equatable, Sendable {
         case .noMatchingTarget:
             return "Choose a different measurement variant."
         case .unsupportedVariant:
-            return "Pick a measurement taken on a known rig instead."
+            return "Choose a different measurement source or import a correction by hand."
         case .unsupportedFilter:
             return "Choose a different target or variant."
         }

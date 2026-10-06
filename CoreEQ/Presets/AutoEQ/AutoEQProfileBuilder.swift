@@ -50,17 +50,6 @@ enum AutoEQProfileBuilder {
             isBuiltIn: false)
     }
 
-    /// Builds a profile from the text AutoEQ publishes for variants that cannot
-    /// be sent to `/equalize`. Named for the model; `source` and `form` are
-    /// accepted so callers can hand over everything they fetched without
-    /// reshaping it, but the text is the whole profile.
-    static func makeFallbackProfile(
-        model: String, source: String, form: String, parametricEQText: String
-    ) throws -> EQProfile {
-        _ = (source, form)
-        return try makeProfile(model: model, parametricEQText: parametricEQText)
-    }
-
     /// AutoEQ filter type to EqualizerAPO code. Anything absent is skipped.
     private static let apoCodes: [String: String] = [
         "PEAKING": "PK",

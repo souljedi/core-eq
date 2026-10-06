@@ -1,0 +1,56 @@
+#+TITLE: Local AutoEq corrections
+
+The catalog uses AutoEq's published ParametricEQ.txt correction by default.
+Choose a compatible alternative target to compute a correction locally. The
+by-hand import can also bring in a correction created on autoeq.app.
+
+* Coverage and provenance
+
+The catalog and published corrections come from the AutoEq GitHub repository
+at the catalog's 40-character commit revision. AutoEq's README identifies
+measurements from independent providers. The browser credits AutoEq and Jaakko
+Pasanen and names the selected measurement source. The catalog downloads target
+curves and selected response CSVs to compute and cache corrections locally.
+The copyright-notice question raised in
+[[https://github.com/jaakkopasanen/AutoEq/issues/790][upstream issue 790]]
+was discussed there and concluded not to be an issue. Crinacle paths remain
+excluded when parsing the catalog and at download boundaries. The application
+bundles no measurement data. AutoEq's MIT license is included in
+Resources/AutoEq-LICENSE.txt.
+
+An alternative target must match the measurement's source, rig and form
+metadata. A missing rig in target metadata means any rig for that source and
+form. Incompatible targets are omitted. Published corrections remain available
+if optional target metadata cannot be downloaded. Downloaded published
+corrections are cached locally by upstream revision and result path.
+
+* Algorithm and limits
+
+This is a native approximate response fitter, not a bit-identical port of AutoEq's
+SciPy optimization. It uses log-frequency linear interpolation, aligns measurement
+and target at 1 kHz, includes the upstream target's bassBoost shelf, clamps desired
+correction to -12 through +6 dB and tapers correction above 6 kHz to zero at 20 kHz.
+It fits two shelves and eight peaking filters by bounded coordinate descent using
+CoreEQ's RBJ biquads at 44.1 kHz. Frequency bounds are 20 Hz to 10 kHz, Q bounds
+0.3 through 4 for peaks (shelves keep Q 0.7 to avoid resonant overshoot)
+and individual gain bounds -12 through +6 dB. It does not reproduce
+AutoEq's Savitzky-Golay smoothing, slope limiting or SciPy optimizer. Sharp nulls,
+very irregular measurements and treble corrections can differ substantially.
+
+The sum of positive filter gains is limited to 11.75 dB. Preamp is the negative
+of this sum minus 0.2 dB headroom, rounded by the standard profile importer. This
+conservative bound fits CoreEQ's -12 dB preamp limit and protects peaks between
+sampled frequencies. It can attenuate more than upstream's peak-response preamp.
+
+Input caches use the upstream revision and path. Computed cache keys include
+revision, exact response bytes, encoded target, result path and solver version.
+The application uses no shared backend or Python runtime.
+
+* Numerical validation
+
+Solver tests use generated response curves and include no provider measurements
+or captured backend requests. They check fit error against the synthetic target,
+filter gain limits, preamp bounds, cancellation and malformed input. Upstream
+results were also compared with local output during implementation. Comparison
+results and captured backend payloads were deliberately not added to the
+repository. Tests do not send requests to autoeq.app.

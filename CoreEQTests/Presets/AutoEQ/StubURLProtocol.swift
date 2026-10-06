@@ -1,4 +1,10 @@
 import Foundation
+import Testing
+
+/// Both network and store tests share the protocol registry and must not run
+/// concurrently with one another.
+@Suite(.serialized)
+struct AutoEQIntegrationTests {}
 
 /// The handler a `StubURLProtocol` serves requests with.
 typealias StubHandler = @Sendable (URLRequest) throws -> (HTTPURLResponse, Data)

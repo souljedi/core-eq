@@ -1,184 +1,251 @@
 import Foundation
 import Testing
 
-/// Serialized because the stub protocol's handler and request log are process
-/// global; these tests must not interleave.
-@Suite(.serialized)
-struct AutoEQNetworkServiceTests {
-    private func makeService(cache: URL) -> AutoEQNetworkService {
-        AutoEQNetworkService(session: .autoEQStubbed(), cacheDirectory: cache)
-    }
+extension AutoEQIntegrationTests {
+    struct NetworkService {
+        private func service(_ cache: URL) -> AutoEQNetworkService {
+            AutoEQNetworkService(session: .autoEQStubbed(), cacheDirectory: cache)
+        }
 
-    private static func catalogHandler() -> StubHandler {
-        { request in
-            guard let url = request.url else { throw URLError(.badURL) }
-            switch url.path {
-            case "/entries":
-                return (httpResponse(url: url), AutoEQTestFixtures.entriesData)
-            case "/targets":
-                return (httpResponse(url: url), AutoEQTestFixtures.targetsData)
-            default:
-                throw URLError(.badURL)
+        @Test func doesNoWorkUntilRequestedThenPinsCatalogAndReportsProgress() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            StubURLProtocol.setHandler(AutoEQTestFixtures.catalogHandler())
+            let service = service(cache)
+            #expect(StubURLProtocol.requests.isEmpty)
+            let progress = ProgressLog()
+            let catalog = try await service.loadCatalog { await progress.append($0) }
+            #expect(catalog.models.count == 3)
+            #expect(catalog.revision == AutoEQTestFixtures.revision)
+            #expect(!catalog.isStale)
+            #expect(StubURLProtocol.requests.count == 2)
+            #expect(StubURLProtocol.requests.last?.url?.path.contains(catalog.revision) == true)
+            #expect(
+                StubURLProtocol.requests.allSatisfy {
+                    $0.httpMethod == "GET" && $0.url?.host != "autoeq.app"
+                        && $0.value(forHTTPHeaderField: "User-Agent")
+                            == AutoEQNetworkService.userAgent
+                })
+            let events = await progress.events
+            #expect(events.first == .checkingRevision)
+            #expect(
+                events.contains(
+                    .downloading(
+                        received: AutoEQTestFixtures.indexData.count,
+                        total: AutoEQTestFixtures.indexData.count)))
+            #expect(events.last == .preparing)
+            #expect(
+                FileManager.default.fileExists(
+                    atPath: cache.appendingPathComponent("catalog-v1.json").path))
+        }
+
+        @Test func freshDiskCacheWorksAcrossServiceInstancesWithoutNetwork() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            StubURLProtocol.setHandler(AutoEQTestFixtures.catalogHandler())
+            _ = try await service(cache).loadCatalog()
+            StubURLProtocol.setHandler { _ in throw URLError(.notConnectedToInternet) }
+            let catalog = try await service(cache).loadCatalog()
+            #expect(catalog.models.count == 3)
+            #expect(StubURLProtocol.requests.isEmpty)
+        }
+
+        @Test func staleCacheSurvivesOfflineRefreshAndIsMarkedStale() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            try AutoEQTestFixtures.writeCache(
+                into: cache, checkedAt: Date().addingTimeInterval(-8 * 86_400))
+            StubURLProtocol.setHandler { _ in throw URLError(.notConnectedToInternet) }
+            let catalog = try await service(cache).loadCatalog()
+            #expect(catalog.isStale)
+            #expect(catalog.revision == AutoEQTestFixtures.revision)
+        }
+
+        @Test func unchangedRevisionOnlyChecksTheRevision() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            try AutoEQTestFixtures.writeCache(into: cache)
+            StubURLProtocol.setHandler(AutoEQTestFixtures.catalogHandler())
+            let catalog = try await service(cache).loadCatalog(forceRefresh: true)
+            #expect(!catalog.isStale)
+            #expect(StubURLProtocol.requests.map(\.url) == [AutoEQNetworkService.revisionURL])
+        }
+
+        @Test func newRevisionUpdatesTheSnapshotAndPinsDownloads() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            try AutoEQTestFixtures.writeCache(into: cache)
+            StubURLProtocol.setHandler(
+                AutoEQTestFixtures.catalogHandler(revision: AutoEQTestFixtures.nextRevision))
+            let catalog = try await service(cache).loadCatalog(forceRefresh: true)
+            #expect(catalog.revision == AutoEQTestFixtures.nextRevision)
+            #expect(StubURLProtocol.requests.last?.url?.path.contains(catalog.revision) == true)
+            StubURLProtocol.setHandler { _ in throw URLError(.notConnectedToInternet) }
+            #expect(try await service(cache).loadCatalog().revision == catalog.revision)
+        }
+
+        @Test func failedIndexUpdateKeepsTheOldSnapshotAtomically() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            try AutoEQTestFixtures.writeCache(into: cache)
+            StubURLProtocol.setHandler(
+                AutoEQTestFixtures.catalogHandler(
+                    revision: AutoEQTestFixtures.nextRevision, index: Data("broken".utf8)))
+            let catalog = try await service(cache).loadCatalog(forceRefresh: true)
+            #expect(catalog.revision == AutoEQTestFixtures.revision)
+            #expect(catalog.isStale)
+            #expect(try await service(cache).loadCatalog().revision == AutoEQTestFixtures.revision)
+        }
+
+        @Test func noCacheAndNoNetworkReportsOffline() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            StubURLProtocol.setHandler { _ in throw URLError(.notConnectedToInternet) }
+            await #expect(throws: AutoEQError.offline) {
+                _ = try await service(cache).loadCatalog()
             }
         }
-    }
 
-    @Test func loadsCatalogAndWritesCache() async throws {
-        let cache = AutoEQTestFixtures.makeCacheDirectory()
-        defer { AutoEQTestFixtures.remove(cache) }
-        StubURLProtocol.setHandler(Self.catalogHandler())
-        let service = makeService(cache: cache)
+        @Test(arguments: [0, 2]) func incompatibleCacheVersionIsRefetched(version: Int) async throws
+        {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            try AutoEQTestFixtures.writeCache(into: cache, version: version)
+            StubURLProtocol.setHandler(AutoEQTestFixtures.catalogHandler())
+            _ = try await service(cache).loadCatalog()
+            #expect(StubURLProtocol.requests.count == 2)
+        }
 
-        let catalog = try await service.loadCatalog()
+        @Test func corruptCacheAndLegacyCacheAreIgnored() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            try Data("{}".utf8).write(to: cache.appendingPathComponent("catalog-v1.json"))
+            try Data("legacy backend entries".utf8).write(
+                to: cache.appendingPathComponent("entries.json"))
+            StubURLProtocol.setHandler(AutoEQTestFixtures.catalogHandler())
+            #expect(try await service(cache).loadCatalog().models.count == 3)
+            #expect(StubURLProtocol.requests.count == 2)
+        }
 
-        #expect(
-            catalog.models.map(\.name) == [
-                "Alpha Headphones", "Café Audio", "Zeta Headphones",
-            ])
-        #expect(catalog.targets.count == 3)
-        let manager = FileManager.default
-        #expect(manager.fileExists(atPath: cache.appendingPathComponent("entries.json").path))
-        #expect(manager.fileExists(atPath: cache.appendingPathComponent("targets.json").path))
-        // The documented User-Agent goes out on every request.
-        #expect(
-            StubURLProtocol.requests.allSatisfy {
-                $0.value(forHTTPHeaderField: "User-Agent") == AutoEQNetworkService.userAgent
-            })
-    }
+        @Test func profilesDownloadOnDemandAndWorkOfflineAfterRestart() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            try AutoEQTestFixtures.writeCache(into: cache)
+            StubURLProtocol.setHandler(AutoEQTestFixtures.catalogHandler())
+            let service = service(cache)
+            let catalog = try await service.loadCatalog()
+            #expect(StubURLProtocol.requests.isEmpty)
+            let variant = try #require(catalog.models.first?.variants.first)
+            let text = try await service.fetchPrecomputedParametricEQ(
+                model: "Alpha Headphones", variant: variant, revision: catalog.revision)
+            #expect(text == AutoEQTestFixtures.profileText)
+            #expect(StubURLProtocol.requests.count == 1)
+            #expect(StubURLProtocol.requests.first?.url?.path.contains(catalog.revision) == true)
+            StubURLProtocol.setHandler { _ in throw URLError(.notConnectedToInternet) }
+            #expect(
+                try await self.service(cache).fetchPrecomputedParametricEQ(
+                    model: "Alpha Headphones", variant: variant, revision: catalog.revision) == text
+            )
+            #expect(StubURLProtocol.requests.isEmpty)
+        }
 
-    @Test func secondLoadIsServedFromFreshCache() async throws {
-        let cache = AutoEQTestFixtures.makeCacheDirectory()
-        defer { AutoEQTestFixtures.remove(cache) }
-        StubURLProtocol.setHandler(Self.catalogHandler())
-        let service = makeService(cache: cache)
-        _ = try await service.loadCatalog()
+        @Test func profileCacheNeverCrossesRevisionBoundaries() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            StubURLProtocol.setHandler(AutoEQTestFixtures.catalogHandler())
+            let service = service(cache)
+            let variant = AutoEQVariant(
+                source: "oratory1990", form: "over-ear",
+                resultPath: "oratory1990/over-ear/Alpha Headphones")
+            _ = try await service.fetchPrecomputedParametricEQ(
+                model: "Alpha Headphones", variant: variant, revision: AutoEQTestFixtures.revision)
+            _ = try await service.fetchPrecomputedParametricEQ(
+                model: "Alpha Headphones", variant: variant,
+                revision: AutoEQTestFixtures.nextRevision)
+            #expect(StubURLProtocol.requests.count == 2)
+        }
 
-        // A failing handler: if the fresh cache is used, no request is made.
-        StubURLProtocol.setHandler { _ in throw URLError(.notConnectedToInternet) }
-        let second = try await service.loadCatalog()
+        @Test func rejectsRestrictedSourcesAndUnsafePathsBeforeNetwork() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            StubURLProtocol.setHandler { _ in throw URLError(.badURL) }
+            for path in [
+                "crinacle/711 in-ear/Alpha", "Crinacle/over-ear/Alpha",
+                "../over-ear/Alpha", "source/over-ear/../Alpha",
+            ] {
+                let variant = AutoEQVariant(
+                    source: path.components(separatedBy: "/")[0],
+                    form: "over-ear", resultPath: path)
+                await #expect(throws: AutoEQError.unsupportedVariant) {
+                    _ = try await service(cache).fetchPrecomputedParametricEQ(
+                        model: "Alpha", variant: variant, revision: AutoEQTestFixtures.revision)
+                }
+            }
+            #expect(StubURLProtocol.requests.isEmpty)
+        }
 
-        #expect(second.models.count == 3)
-        #expect(StubURLProtocol.requests.isEmpty)
-    }
+        @Test func malformedProfileIsNotCachedAndCanBeRetried() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            let variant = AutoEQVariant(
+                source: "source", form: "over-ear", resultPath: "source/over-ear/Alpha")
+            StubURLProtocol.setHandler { request in
+                (httpResponse(url: request.url!), Data("<html>Error</html>".utf8))
+            }
+            do {
+                _ = try await service(cache).fetchPrecomputedParametricEQ(
+                    model: "Alpha", variant: variant, revision: AutoEQTestFixtures.revision)
+                Issue.record("Malformed profile was accepted")
+            } catch {}
+            StubURLProtocol.setHandler(AutoEQTestFixtures.catalogHandler())
+            _ = try await service(cache).fetchPrecomputedParametricEQ(
+                model: "Alpha", variant: variant, revision: AutoEQTestFixtures.revision)
+            #expect(StubURLProtocol.requests.count == 1)
+        }
 
-    @Test func networkErrorWithNoCacheThrowsOffline() async throws {
-        let cache = AutoEQTestFixtures.makeCacheDirectory()
-        defer { AutoEQTestFixtures.remove(cache) }
-        StubURLProtocol.setHandler { _ in throw URLError(.notConnectedToInternet) }
-        let service = makeService(cache: cache)
+        @Test func rateLimitPreservesCacheAndReportsHTTPStatusWithoutCache() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            StubURLProtocol.setHandler { request in
+                (httpResponse(url: request.url!, status: 403), Data())
+            }
+            await #expect(throws: AutoEQError.httpStatus(403)) {
+                _ = try await service(cache).loadCatalog()
+            }
+            try AutoEQTestFixtures.writeCache(into: cache)
+            #expect(try await service(cache).loadCatalog(forceRefresh: true).isStale)
+        }
 
-        do {
-            _ = try await service.loadCatalog()
-            Issue.record("expected loadCatalog to throw")
-        } catch {
-            #expect(error as? AutoEQError == .offline)
+        @Test func cancellationDoesNotReturnStaleDataOrPublishNewCache() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            try AutoEQTestFixtures.writeCache(into: cache)
+            StubURLProtocol.setHandler { _ in throw URLError(.cancelled) }
+            await #expect(throws: URLError.self) {
+                _ = try await service(cache).loadCatalog(forceRefresh: true)
+            }
+            StubURLProtocol.setHandler(AutoEQTestFixtures.catalogHandler())
+            let task = Task {
+                try await service(cache).loadCatalog(forceRefresh: true) { _ in
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }
+            }
+            await #expect(throws: CancellationError.self) { _ = try await task.value }
+        }
+
+        @Test func urlsEncodeReservedCharactersAndProgressHandlesUnknownLength() {
+            let url = AutoEQNetworkService.resultURL(
+                revision: AutoEQTestFixtures.revision,
+                path: "Source Name/711 in-ear/A & B?#%/A & B?#% ParametricEQ.txt")
+            #expect(url.query == nil && url.fragment == nil)
+            #expect(url.absoluteString.contains("A%20%26%20B%3F%23%25"))
+            #expect(AutoEQCatalogProgress.downloading(received: 10, total: nil).fraction == nil)
+            #expect(AutoEQCatalogProgress.downloading(received: 50, total: 100).fraction == 0.5)
         }
     }
+}
 
-    @Test func networkErrorWithStaleCacheReturnsStaleCatalog() async throws {
-        let cache = AutoEQTestFixtures.makeCacheDirectory()
-        defer { AutoEQTestFixtures.remove(cache) }
-        AutoEQTestFixtures.writeCache(
-            into: cache, modified: Date().addingTimeInterval(-8 * 24 * 60 * 60))
-        StubURLProtocol.setHandler { _ in throw URLError(.notConnectedToInternet) }
-        let service = makeService(cache: cache)
-
-        let catalog = try await service.loadCatalog()
-
-        #expect(catalog.models.count == 3)
-    }
-
-    @Test func equalizeReturnsComputedProfile() async throws {
-        let cache = AutoEQTestFixtures.makeCacheDirectory()
-        defer { AutoEQTestFixtures.remove(cache) }
-        StubURLProtocol.setHandler { request in
-            guard let url = request.url else { throw URLError(.badURL) }
-            return (httpResponse(url: url), Data(AutoEQTestFixtures.equalizeJSON.utf8))
-        }
-        let service = makeService(cache: cache)
-        let variant = AutoEQVariant(
-            source: "oratory1990", rig: "GRAS 43AG-7", form: "over-ear")
-
-        let profile = try await service.equalize(
-            model: "Alpha Headphones", variant: variant, targetLabel: "Harman over-ear 2013")
-
-        #expect(profile.preamp == -6.0)
-        #expect(profile.filters.count == 2)
-        #expect(profile.filters[0].type == "PEAKING")
-        #expect(profile.filters[0].fc == 105.0)
-        #expect(profile.filters[1].type == "LOW_SHELF")
-        #expect(StubURLProtocol.requests.first?.httpMethod == "POST")
-
-        // The same selection is deterministic, so a second preview is served
-        // from the service cache without another server call.
-        _ = try await service.equalize(
-            model: "Alpha Headphones", variant: variant, targetLabel: "Harman over-ear 2013")
-        #expect(StubURLProtocol.requests.count == 1)
-        #expect(
-            StubURLProtocol.requests.first?.value(forHTTPHeaderField: "User-Agent")
-                == AutoEQNetworkService.userAgent)
-    }
-
-    @Test func equalizeNon200ThrowsHTTPStatus() async throws {
-        let cache = AutoEQTestFixtures.makeCacheDirectory()
-        defer { AutoEQTestFixtures.remove(cache) }
-        StubURLProtocol.setHandler { request in
-            guard let url = request.url else { throw URLError(.badURL) }
-            return (httpResponse(url: url, status: 422), Data())
-        }
-        let service = makeService(cache: cache)
-        let variant = AutoEQVariant(
-            source: "oratory1990", rig: "GRAS 43AG-7", form: "over-ear")
-
-        do {
-            _ = try await service.equalize(
-                model: "Alpha Headphones", variant: variant, targetLabel: "Harman over-ear 2013")
-            Issue.record("expected equalize to throw")
-        } catch {
-            #expect(error as? AutoEQError == .httpStatus(422))
-        }
-    }
-
-    @Test func equalizeWithNilRigThrowsUnsupportedVariant() async throws {
-        let cache = AutoEQTestFixtures.makeCacheDirectory()
-        defer { AutoEQTestFixtures.remove(cache) }
-        StubURLProtocol.setHandler { _ in throw URLError(.badURL) }
-        let service = makeService(cache: cache)
-        let variant = AutoEQVariant(source: "crinacle", rig: nil, form: "in-ear")
-
-        do {
-            _ = try await service.equalize(
-                model: "Alpha Headphones", variant: variant, targetLabel: "Harman in-ear 2019")
-            Issue.record("expected equalize to throw")
-        } catch {
-            #expect(error as? AutoEQError == .unsupportedVariant)
-        }
-        #expect(StubURLProtocol.requests.isEmpty)
-    }
-
-    @Test func fetchesPrecomputedText() async throws {
-        let cache = AutoEQTestFixtures.makeCacheDirectory()
-        defer { AutoEQTestFixtures.remove(cache) }
-        let text = "Preamp: -1.0 dB\nFilter 1: ON PK Fc 1000 Hz Gain 1.0 dB Q 1.00\n"
-        StubURLProtocol.setHandler { request in
-            guard let url = request.url else { throw URLError(.badURL) }
-            return (httpResponse(url: url), Data(text.utf8))
-        }
-        let service = makeService(cache: cache)
-
-        let fetched = try await service.fetchPrecomputedParametricEQ(
-            model: "Zeta Headphones", source: "oratory1990", form: "over-ear")
-
-        #expect(fetched == text)
-    }
-
-    @Test func precomputedURLPercentEncodesSpaces() throws {
-        let url = try #require(
-            AutoEQNetworkService.precomputedParametricEQURL(
-                model: "Sennheiser HD 600", source: "oratory1990", form: "over-ear"))
-        #expect(
-            url.absoluteString
-                == "https://cdn.jsdelivr.net/gh/jaakkopasanen/AutoEq@master/results/oratory1990/"
-                + "over-ear/Sennheiser%20HD%20600/Sennheiser%20HD%20600%20ParametricEQ.txt")
-    }
+private actor ProgressLog {
+    var events: [AutoEQCatalogProgress] = []
+    func append(_ value: AutoEQCatalogProgress) { events.append(value) }
 }
