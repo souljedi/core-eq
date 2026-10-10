@@ -1,12 +1,13 @@
 import Foundation
 
-/// Turns AutoEQ's computed filters into a CoreEQ `EQProfile`.
+/// Turns AutoEq correction filters into a CoreEQ `ImportCandidates`.
 ///
-/// Every path goes through `ParametricEQParser.parse`, so a profile built from
-/// the API is normalized, clamped, and trimmed exactly like one imported from a
-/// file — including the ladder-band recovery and the free-filter budget.
+/// Uses the shared import parser, so a published correction follows the same
+/// disclosure path as any other import: representable values are kept exact,
+/// and anything CoreEQ must change is reported rather than silently clamped or
+/// rejected.
 enum AutoEQProfileBuilder {
-    /// Builds a profile from AutoEQ's JSON equalization.
+    /// Builds candidates from AutoEQ's JSON equalization.
     ///
     /// The filters are rendered to EqualizerAPO text with invariant formatting
     /// and parsed back, which is what makes the result indistinguishable from an
@@ -14,7 +15,9 @@ enum AutoEQProfileBuilder {
     /// leaves nothing, the whole profile is rejected rather than shown empty.
     ///
     /// - Throws: `AutoEQError.unsupportedFilter` when every filter was skipped.
-    static func makeProfile(model: String, equalized: AutoEQEqualizedProfile) throws -> EQProfile {
+    static func makeProfile(
+        model: String, equalized: AutoEQEqualizedProfile, sampleRate: Double = 44_100
+    ) throws -> ImportCandidates {
         var lines = ["Preamp: \(ParametricEQSerializer.formatGain(equalized.preamp)) dB"]
         var unknownTypes: [String] = []
         var index = 1
@@ -36,18 +39,23 @@ enum AutoEQProfileBuilder {
             throw AutoEQError.unsupportedFilter(unknownTypes.joined(separator: ", "))
         }
 
-        return try makeProfile(model: model, parametricEQText: lines.joined(separator: "\n") + "\n")
+        return try makeProfile(
+            model: model, parametricEQText: lines.joined(separator: "\n") + "\n",
+            sampleRate: sampleRate)
     }
 
-    /// Builds a profile from pre-computed EqualizerAPO text, named for the model.
-    static func makeProfile(model: String, parametricEQText: String) throws -> EQProfile {
-        let parsed = try ParametricEQParser.parse(text: parametricEQText, defaultName: model)
-        return EQProfile(
-            name: parsed.name,
-            filters: parsed.filters,
-            preamp: parsed.preamp,
-            autoGain: parsed.autoGain,
-            isBuiltIn: false)
+    /// Builds candidates from pre-computed EqualizerAPO text, named for the
+    /// model.
+    ///
+    /// No correction is rejected for being out of range: the parser's candidates
+    /// carry the exact and clipped chains plus the disclosure, and the caller
+    /// decides what to show and whether to offer clipping.
+    static func makeProfile(
+        model: String, parametricEQText: String, sampleRate: Double = 44_100
+    ) throws -> ImportCandidates {
+        let parsed = try ParametricEQParser.parse(
+            text: parametricEQText, defaultName: model, sampleRate: sampleRate)
+        return parsed.candidates
     }
 
     /// AutoEQ filter type to EqualizerAPO code. Anything absent is skipped.

@@ -271,6 +271,7 @@ extension AutoEQIntegrationTests {
                     label: "Peaks", compatible: [], recommended: [],
                     fr: .init(frequency: grid, raw: desired)))
             let profile = try AutoEQProfileBuilder.makeProfile(model: "Peaks", equalized: fitted)
+                .exact
             let peak = try AutoEQLocalSolver.peakGain(fitted.filters)
             #expect(profile.preamp >= -12)
             #expect(profile.preamp + peak <= -0.199)

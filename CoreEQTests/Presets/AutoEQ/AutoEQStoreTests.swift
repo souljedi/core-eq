@@ -111,6 +111,10 @@ extension AutoEQIntegrationTests {
             #expect(profile.preamp == -6)
             #expect(!profile.isBuiltIn)
             #expect(!profile.autoGain)
+            // The candidates behind the preview are published, and a
+            // representable correction flags no adjustment.
+            #expect(store.previewCandidates != nil)
+            #expect(!store.previewWouldAdjust)
             let suite = "coreeq-autoeq-import-\(UUID().uuidString)"
             let defaults = try #require(UserDefaults(suiteName: suite))
             defer { defaults.removePersistentDomain(forName: suite) }
@@ -120,6 +124,35 @@ extension AutoEQIntegrationTests {
             let savedName = try #require(manager.saveAuditionAsPreset(named: profile.name))
             #expect(manager.profile(named: savedName)?.name == profile.name)
             #expect(!manager.isAuditioning)
+        }
+
+        @Test func publishedCorrectionThatWouldAdjustPreviewsAndFlagsIt() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            let store = try await loadedStore(cache)
+            let adjusting = "Preamp: -6 dB\nFilter 1: ON PK Fc 125 Hz Gain -20 dB Q 1.41\n"
+            StubURLProtocol.setHandler { request in
+                let url = request.url!
+                if url.path.hasSuffix(" ParametricEQ.txt") {
+                    return (httpResponse(url: url), Data(adjusting.utf8))
+                }
+                return try AutoEQTestFixtures.catalogHandler()(request)
+            }
+            store.selectModel(named: "Alpha Headphones")
+            let profile = try #require(await store.loadSelectedProfile())
+
+            // It previews rather than failing, and the flag reflects the
+            // disclosure that saving would change the correction.
+            #expect(store.previewState == .ready)
+            #expect(store.previewWouldAdjust)
+            #expect(store.previewCandidates?.disclosure.clippableCount == 1)
+            // The graph and audition hear the exact (kept) version.
+            #expect(profile.freeFilters.first?.gain == -20)
+
+            store.cancelPreview()
+            #expect(store.previewCandidates == nil)
+            #expect(!store.previewWouldAdjust)
+            #expect(store.previewProfile == nil)
         }
 
         @Test func searchAndInvalidSelectionsRemainSafe() async throws {

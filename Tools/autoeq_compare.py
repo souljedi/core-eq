@@ -23,6 +23,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--revision', help='40-character upstream AutoEq commit SHA')
     parser.add_argument('--cases', type=Path, help='JSON regression manifest with revision, paths and per-case RMS tolerances')
+    parser.add_argument('--max-import-distortion', type=float, help='fail if published text changes on import by more than this RMS in dB')
     parser.add_argument('--max-rms', type=float, help='fail cases exceeding this 20 Hz–6 kHz upstream-response RMS tolerance in dB')
     parser.add_argument('--limit', type=int, default=20, help='maximum variants; 0 means entire catalog')
     parser.add_argument('--spread', action='store_true', help='sample evenly across matching catalog entries instead of the first entries')
@@ -44,6 +45,8 @@ def main():
         parser.error('revision must be a lowercase 40-character SHA and limit must be nonnegative')
     if args.max_rms is not None and not (0 < args.max_rms < 100):
         parser.error('max-rms must be positive and finite')
+    if args.max_import_distortion is not None and not (0 <= args.max_import_distortion < 100):
+        parser.error('max-import-distortion must be nonnegative and finite')
     args.cache.mkdir(parents=True, exist_ok=True)
 
     def download(path):
@@ -64,7 +67,8 @@ def main():
         'CoreEQ/Presets/AutoEQ/AutoEQModels.swift', 'CoreEQ/Presets/AutoEQ/AutoEQProfileBuilder.swift',
         'CoreEQ/EQ/Biquad.swift', 'CoreEQ/Presets/EQFilter.swift', 'CoreEQ/Presets/EQProfile.swift',
         'CoreEQ/Presets/BuiltInProfiles.swift', 'CoreEQ/Presets/FilterChain.swift',
-        'CoreEQ/Presets/QuickTone.swift', 'CoreEQ/Presets/ParametricEQParser.swift',
+        'CoreEQ/Presets/ImportDisclosure.swift', 'CoreEQ/Presets/QuickTone.swift',
+        'CoreEQ/Presets/ParametricEQParser.swift',
         'CoreEQ/Presets/ParametricEQSerializer.swift', 'CoreEQ/Extensions/Double+Clamped.swift',
     ]
     binary = args.cache / 'autoeq-compare'
@@ -111,6 +115,9 @@ def main():
                                     check=True, capture_output=True, text=True)
             row.update(json.loads(result.stdout))
             row['error'] = ''
+            if args.max_import_distortion is not None:
+                if row['published_import_distortion_rms_20_6000_db'] > args.max_import_distortion or abs(row['published_preamp_import_error_db']) > args.max_import_distortion:
+                    raise ValueError('published correction changed during import')
             tolerance = cases.get(path, args.max_rms)
             if tolerance is not None:
                 row['max_rms_db'] = tolerance

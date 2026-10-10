@@ -54,9 +54,19 @@ worker, with no Python runtime in the app.
 
 AutoEq's slope limiting and SciPy optimizer are not reproduced. Sharp nulls,
 very irregular measurements and treble corrections can still differ. The
-solver fits within CoreEQ's bounds directly instead of relying on the importer
-to clamp an out-of-range result. Cache version 3 invalidates earlier computed
-profiles; published profiles and input downloads remain reusable.
+solver keeps its existing individual ±12 dB fitting bounds. Published corrections
+can use CoreEQ's wider ±20 dB free-filter range without clamping. Graphic bands
+remain at ±12 dB; an imported filter matching a ladder frequency but exceeding
+that range stays a free filter. Editing, persistence and export retain its gain.
+Catalog profiles are imported through the same disclosure as any other import: a
+representable correction is not refused, and any value CoreEQ would change is
+listed before it commits — the filter, its original and new value, and the limit
+responsible — together with the measured response impact (RMS and maximum dB
+across 20 Hz–20 kHz). The correction is imported keep-exact by default, and a
+bell above the ±12 dB graphic range may instead be clipped back onto its slider.
+Only a profile that cannot be read as a correction at all — an error page, or one
+carrying no gain-bearing filter — is refused.
+Cache version 3 invalidates earlier computed profiles; published profiles and input downloads remain reusable.
 
 Preamp is computed from the peak of the combined, serialized filter response,
 using 4,097 log-spaced samples from 1 Hz to just below Nyquist at 44.1, 48,
@@ -88,9 +98,10 @@ reports. It downloads INDEX.md, each selected response CSV and ParametricEQ.txt
 from an explicit upstream commit, caching outside the repository by default.
 The CSV's target column includes the published default target and bass boost,
 so it can benchmark that target without captured backend data. Its parametric_eq
-column supplies the original upstream response. Published ParametricEQ.txt is
-also imported to report import distortion separately; clamping a published
-filter must not redefine the reference the solver is being measured against. Crinacle sources
+column supplies the original upstream response. Published ParametricEQ.txt is also imported. The report compares its imported
+response with the original text using the same raw filter parser and RBJ engine,
+separating actual import distortion from upstream CSV-to-text serialization
+rounding. Neither defines a different solver reference. Crinacle sources
 are excluded. No downloaded data is committed or bundled with the application.
 
 Run from the repository root (requires Xcode and Python 3):
@@ -113,6 +124,11 @@ and solver version. They also report error against the upstream equalization
 curve, error against the imported published preset, and distortion introduced
 by importing that preset. Response errors exclude preamp. The local result
 passes through CoreEQ's importer, so it measures the correction CoreEQ will play.
+
+=--max-import-distortion <dB>= independently fails a run if a supported published
+text correction or its preamp changes on import. A value of =0.000001= tests
+preservation to numerical precision. A correction that exceeds CoreEQ's ranges is
+imported adjusted and appears here as import distortion.
 
 =--max-rms <dB>= fails a run when any case exceeds the specified 20 Hz–6 kHz
 RMS tolerance. It also checks -12–0 dB preamp, at least 0.19 dB sampled headroom,
@@ -137,3 +153,9 @@ filter into CoreEQ's ±12 dB range. Its original-upstream response error was
 
 A full catalog run and alternative-target upstream-reference validation remain
 open. Default-target comparisons do not prove equivalence for alternative targets.
+
+The import-preservation follow-up checked 100 evenly spaced published presets
+at the same pinned revision with =--max-import-distortion 0.000001=. All passed
+with zero RMS distortion against the original ParametricEQ.txt response and
+zero preamp change. CSV-to-text rounding is reported separately. This checks
+those 100 profiles, not every supported catalog entry.

@@ -442,7 +442,21 @@ final class ProfileManager: ObservableObject {
         /// Whether `name` is only the placeholder — text from the clipboard or a
         /// drop has none of its own — so committing should ask for a real one.
         let needsName: Bool
-        fileprivate let parsed: ParametricEQParser.ParsedPreset
+        /// The chains this import could become and what each choice changes.
+        let candidates: ImportCandidates
+
+        /// What an import would change, and how far it moves the response.
+        var disclosure: ImportDisclosure { candidates.disclosure }
+        /// Whether the user may choose to clip beyond-band values.
+        var offersClipChoice: Bool { candidates.offersClipChoice }
+        /// Whether the import needs confirmation before it commits.
+        var requiresConfirmation: Bool { candidates.disclosure.requiresConfirmation }
+        /// How many values could be clipped into the graphic range.
+        var clippableCount: Int { candidates.disclosure.clippableCount }
+        /// The beyond-band adjustments the clip choice acts on.
+        var clipCandidates: [ImportAdjustment] {
+            candidates.disclosure.adjustments.filter { $0.kind == .keptBeyondBandRange }
+        }
     }
 
     enum ExportError: LocalizedError, Equatable {
@@ -465,9 +479,12 @@ final class ProfileManager: ObservableObject {
     /// `suggestedName` is the file's name when there is a file. Without one the
     /// preset is named by its own content when it has a name (`.coreeq`), or
     /// by the placeholder, which `commitImport` then puts up for rename.
-    func previewImport(text: String, suggestedName: String? = nil) throws -> ImportPreview {
+    func previewImport(
+        text: String, suggestedName: String? = nil, sampleRate: Double = 44_100
+    ) throws -> ImportPreview {
         let parsed = try ParametricEQParser.parse(
-            text: text, defaultName: suggestedName ?? Self.untitledImportName)
+            text: text, defaultName: suggestedName ?? Self.untitledImportName,
+            sampleRate: sampleRate)
         return ImportPreview(
             name: parsed.name,
             // `parsed.filters` always begins with the eleven ladder bands, so the
@@ -479,14 +496,35 @@ final class ProfileManager: ObservableObject {
             unparsedLines: parsed.unparsedLines,
             adjustedValueCount: parsed.adjustedValueCount,
             needsName: suggestedName == nil && parsed.name == Self.untitledImportName,
-            parsed: parsed)
+            candidates: parsed.candidates)
+    }
+
+    /// Wraps an already-parsed pair of chains — the AutoEQ catalog's path, where
+    /// the profile is built rather than read from text — in a preview.
+    func previewImport(
+        candidates: ImportCandidates, name: String, needsName: Bool = false
+    ) -> ImportPreview {
+        let exact = candidates.exact
+        return ImportPreview(
+            name: name,
+            filterCount: exact.filters.filter { !$0.isBand }.count,
+            preamp: exact.preamp,
+            droppedFilterCount: candidates.disclosure.adjustments.filter {
+                $0.kind == .droppedFilter
+            }.count,
+            unparsedLines: [],
+            adjustedValueCount: candidates.disclosure.adjustments.filter {
+                $0.kind != .keptBeyondBandRange && $0.kind != .droppedFilter
+            }.count,
+            needsName: needsName,
+            candidates: candidates)
     }
 
     /// Reads a preset file and parses it, named after the file.
     ///
     /// The size is checked before anything is read: this runs on the main
     /// actor, and a file someone chose by mistake can be any size at all.
-    func previewImport(fileAt url: URL) throws -> ImportPreview {
+    func previewImport(fileAt url: URL, sampleRate: Double = 44_100) throws -> ImportPreview {
         let size = try url.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         guard size <= ParametricEQParser.maxFileSize else {
             throw ParametricEQParser.ParseError.fileTooLarge
@@ -495,19 +533,28 @@ final class ProfileManager: ObservableObject {
         return try previewImport(
             text: text,
             suggestedName: Self.cleanPresetName(
-                from: url.deletingPathExtension().lastPathComponent))
+                from: url.deletingPathExtension().lastPathComponent),
+            sampleRate: sampleRate)
     }
 
     /// Adds a previewed preset to the library and makes it active. A preset
     /// with only the placeholder name lands in inline rename, the way a new
     /// preset does.
+    ///
+    /// Keep-exact is the default, so an import the user did not ask to clip
+    /// preserves every representable value. `choice` only bites when the
+    /// preview actually offers a clip: a chain with no beyond-band bells has
+    /// the same filters either way.
     @discardableResult
-    func commitImport(_ preview: ImportPreview) -> String {
+    func commitImport(_ preview: ImportPreview, choice: ImportChoice = .keepExact) -> String {
+        let source =
+            (choice == .clipBeyondBandRange && preview.offersClipChoice)
+            ? preview.candidates.clipped : preview.candidates.exact
         // `add` makes the name unique.
         let stored = library.add(
             EQProfile(
-                name: preview.name, filters: preview.parsed.filters,
-                preamp: preview.parsed.preamp, autoGain: preview.parsed.autoGain))
+                name: preview.name, filters: source.filters,
+                preamp: source.preamp, autoGain: source.autoGain))
         persistUserProfiles()
         setActiveProfile(name: stored)
         if preview.needsName { profileAwaitingRename = stored }
@@ -602,7 +649,7 @@ final class ProfileManager: ObservableObject {
         let filter = EQFilter(
             kind: kind,
             frequency: frequency.clamped(to: BuiltInProfiles.filterFrequencyRange),
-            gain: gain.clamped(to: BuiltInProfiles.gainRange),
+            gain: gain.clamped(to: BuiltInProfiles.filterGainRange),
             q: q.clamped(to: BuiltInProfiles.filterQRange),
             colorIndex: nextColorIndex
         )
@@ -628,7 +675,7 @@ final class ProfileManager: ObservableObject {
     }
 
     func setFilterGain(_ gain: Double, id: UUID) {
-        updateFreeFilter(id: id) { $0.gain = gain.clamped(to: BuiltInProfiles.gainRange) }
+        updateFreeFilter(id: id) { $0.gain = gain.clamped(to: BuiltInProfiles.filterGainRange) }
     }
 
     func setFilterQ(_ q: Double, id: UUID) {

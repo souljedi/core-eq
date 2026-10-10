@@ -27,6 +27,9 @@ final class AutoEQStore: ObservableObject {
     @Published private(set) var models: [AutoEQModel] = []
     @Published private(set) var targets: [AutoEQTarget] = []
     @Published private(set) var previewProfile: EQProfile?
+    /// The exact and clipped chains behind `previewProfile`, or nil when no
+    /// preview is loaded. Drives the browser's "this save would adjust" notice.
+    @Published private(set) var previewCandidates: ImportCandidates?
     @Published private(set) var catalogProgress: AutoEQCatalogProgress = .checkingRevision
     @Published private(set) var catalogRevision: String = ""
     @Published private(set) var catalogIsStale = false
@@ -186,7 +189,7 @@ final class AutoEQStore: ObservableObject {
 
     /// Fetches and builds the profile for the current selection.
     @discardableResult
-    func loadSelectedProfile() async -> EQProfile? {
+    func loadSelectedProfile(sampleRate: Double = 44_100) async -> EQProfile? {
         let requestID = UUID()
         previewRequestID = requestID
         guard let model = selectedModel, let variant = selectedVariant,
@@ -194,30 +197,34 @@ final class AutoEQStore: ObservableObject {
         else {
             previewState = .idle
             previewProfile = nil
+            previewCandidates = nil
             return nil
         }
         guard let targetLabel = selectedTargetLabel else {
             previewState = .failed(AutoEQError.noMatchingTarget.localizedDescription)
             previewProfile = nil
+            previewCandidates = nil
             return nil
         }
 
         previewProfile = nil
+        previewCandidates = nil
         previewState = .loading
         do {
-            let profile: EQProfile
+            let candidates: ImportCandidates
             if targetLabel != AutoEQCatalogParser.defaultTargetLabel,
                 let target = availableTargets.first(where: { $0.label == targetLabel })
             {
                 let computed = try await service.computeProfile(
                     model: model.name, variant: variant, target: target, revision: revision)
-                profile = try AutoEQProfileBuilder.makeProfile(
-                    model: model.name + " · " + targetLabel, equalized: computed)
+                candidates = try AutoEQProfileBuilder.makeProfile(
+                    model: model.name + " · " + targetLabel, equalized: computed,
+                    sampleRate: sampleRate)
             } else {
                 let text = try await service.fetchPrecomputedParametricEQ(
                     model: model.name, variant: variant, revision: revision)
-                profile = try AutoEQProfileBuilder.makeProfile(
-                    model: model.name, parametricEQText: text)
+                candidates = try AutoEQProfileBuilder.makeProfile(
+                    model: model.name, parametricEQText: text, sampleRate: sampleRate)
             }
             guard !Task.isCancelled,
                 previewRequestID == requestID,
@@ -226,12 +233,16 @@ final class AutoEQStore: ObservableObject {
                 selectedTargetLabel == targetLabel,
                 catalog?.revision == revision
             else { return nil }
-            previewProfile = profile
+            // The graph and the audition hear the exact version; the disclosure
+            // tells the browser whether saving it would change anything.
+            previewCandidates = candidates
+            previewProfile = candidates.exact
             previewState = .ready
-            return profile
+            return candidates.exact
         } catch {
             guard !Task.isCancelled, previewRequestID == requestID else { return nil }
             previewProfile = nil
+            previewCandidates = nil
             previewState = .failed(Self.message(for: error))
             return nil
         }
@@ -239,7 +250,7 @@ final class AutoEQStore: ObservableObject {
 
     /// Follows a selection after a short pause, so moving through the model,
     /// measurement, or target lists does not make a request for every row.
-    func schedulePreview(after delay: UInt64 = 300_000_000) {
+    func schedulePreview(after delay: UInt64 = 300_000_000, sampleRate: Double = 44_100) {
         cancelPreview()
         previewTask = Task { @MainActor [weak self] in
             do {
@@ -248,7 +259,7 @@ final class AutoEQStore: ObservableObject {
                 return
             }
             guard let self, !Task.isCancelled else { return }
-            _ = await self.loadSelectedProfile()
+            _ = await self.loadSelectedProfile(sampleRate: sampleRate)
         }
     }
 
@@ -257,7 +268,13 @@ final class AutoEQStore: ObservableObject {
         previewTask = nil
         previewRequestID = UUID()
         previewProfile = nil
+        previewCandidates = nil
         previewState = .idle
+    }
+
+    /// Whether saving the previewed correction would change it to fit CoreEQ.
+    var previewWouldAdjust: Bool {
+        previewCandidates?.disclosure.requiresConfirmation == true
     }
 
     // MARK: - Helpers

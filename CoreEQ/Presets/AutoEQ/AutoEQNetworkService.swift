@@ -215,8 +215,17 @@ actor AutoEQNetworkService {
         guard let text = String(data: data, encoding: .utf8) else {
             throw AutoEQError.malformedData
         }
-        // A 200 response containing an error page must not poison offline previews.
-        _ = try AutoEQProfileBuilder.makeProfile(model: model, parametricEQText: text)
+        // A 200 response containing an error page must not poison offline
+        // previews. This validates shape, not range: an out-of-range value is
+        // disclosed on every load, so only text that carries no gain-bearing
+        // filter at all is rejected here.
+        _ = try ParametricEQParser.parse(text: text, defaultName: model)
+        let sourceFilters = text.components(separatedBy: .newlines).compactMap {
+            ParametricEQParser.parseFilterLine(from: $0.trimmingCharacters(in: .whitespaces))
+        }
+        guard sourceFilters.contains(where: { $0.kind.usesGain }) else {
+            throw AutoEQError.malformedData
+        }
         return text
     }
 

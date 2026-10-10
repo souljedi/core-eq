@@ -203,6 +203,51 @@ extension AutoEQIntegrationTests {
             #expect(StubURLProtocol.requests.count == 1)
         }
 
+        @Test func outOfRangePrecomputedProfileIsCachedForLoadTimeDisclosure() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            let variant = AutoEQVariant(
+                source: "source", form: "over-ear", resultPath: "source/over-ear/Alpha")
+            let adjusting = "Preamp: -6 dB\nFilter 1: ON PK Fc 125 Hz Gain -20 dB Q 1.41\n"
+            StubURLProtocol.setHandler { request in
+                (httpResponse(url: request.url!), Data(adjusting.utf8))
+            }
+            // Range is no longer a download-time rejection: the raw text is
+            // cached, and the load discloses any adjustment.
+            let text = try await service(cache).fetchPrecomputedParametricEQ(
+                model: "Alpha", variant: variant, revision: AutoEQTestFixtures.revision)
+            #expect(text == adjusting)
+        }
+
+        @Test(arguments: [0.0, 3.0])
+        func precomputedGraphicBandCorrectionIsAccepted(gain: Double) async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            let variant = AutoEQVariant(
+                source: "source", form: "over-ear", resultPath: "source/over-ear/Alpha")
+            let text = "Preamp: -3 dB\nFilter 1: ON PK Fc 125 Hz Gain \(gain) dB Q 1.41\n"
+            StubURLProtocol.setHandler { request in
+                (httpResponse(url: request.url!), Data(text.utf8))
+            }
+            let loaded = try await service(cache).fetchPrecomputedParametricEQ(
+                model: "Alpha", variant: variant, revision: AutoEQTestFixtures.revision)
+            #expect(loaded == text)
+        }
+
+        @Test func precomputedProfileWithoutAGainBearingFilterIsRejected() async throws {
+            let cache = AutoEQTestFixtures.makeCacheDirectory()
+            defer { AutoEQTestFixtures.remove(cache) }
+            let variant = AutoEQVariant(
+                source: "source", form: "over-ear", resultPath: "source/over-ear/Alpha")
+            StubURLProtocol.setHandler { request in
+                (httpResponse(url: request.url!), Data("Filter 1: ON HP Fc 20 Hz Q 0.71\n".utf8))
+            }
+            await #expect(throws: AutoEQError.malformedData) {
+                _ = try await service(cache).fetchPrecomputedParametricEQ(
+                    model: "Alpha", variant: variant, revision: AutoEQTestFixtures.revision)
+            }
+        }
+
         @Test func rateLimitPreservesCacheAndReportsHTTPStatusWithoutCache() async throws {
             let cache = AutoEQTestFixtures.makeCacheDirectory()
             defer { AutoEQTestFixtures.remove(cache) }

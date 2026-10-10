@@ -17,6 +17,7 @@ import SwiftUI
 struct AutoEQBrowserView: View {
     @ObservedObject var store: AutoEQStore
     @ObservedObject var profileManager: ProfileManager
+    @ObservedObject var audioEngine: AudioEngine
 
     /// Closes the window. This view is a window's root rather than a sheet, so
     /// there is no presentation for `dismiss` to end; the app that owns the
@@ -33,6 +34,15 @@ struct AutoEQBrowserView: View {
 
     /// Whether the search field holds the keyboard when the window opens.
     @FocusState private var searchFieldFocused: Bool
+
+    /// A save that would change the correction, held until the user decides.
+    /// The same sheet the manual import paths show, presented over the catalog.
+    @State private var confirmationImport: ProfileManager.ImportPreview?
+
+    /// Set when the confirmation sheet's Import is chosen: the catalog closes
+    /// once that sheet is fully gone, so the window's dismissal never lands in
+    /// the same run loop as the sheet's.
+    @State private var closeAfterConfirmation = false
 
     /// The page size `AutoEQStore.searchResults` caps a search at. The count
     /// line says when the cap was reached rather than quoting a total it cannot
@@ -67,6 +77,7 @@ struct AutoEQBrowserView: View {
         .onChange(of: store.selectedVariant) { _, _ in selectionDidChange() }
         .onChange(of: store.selectedTargetLabel) { _, _ in selectionDidChange() }
         .onChange(of: store.catalogRevision) { _, _ in selectionDidChange() }
+        .onChange(of: audioEngine.sampleRate) { _, _ in selectionDidChange() }
         .onChange(of: store.catalogState) { _, state in
             if state == .loaded && store.selectedModelName != nil { selectionDidChange() }
         }
@@ -82,6 +93,29 @@ struct AutoEQBrowserView: View {
             store.cancelCatalogLoad()
             stopAuditionIfNeeded()
         }
+        // Saving a correction CoreEQ would change goes through the same
+        // disclosure sheet the manual import paths show, over the catalog.
+        .sheet(item: $confirmationImport, onDismiss: closeAfterConfirmationIfNeeded) { preview in
+            ImportConfirmationSheet(
+                preview: preview,
+                onConfirm: { choice in
+                    profileManager.commitImport(preview, choice: choice)
+                    closeAfterConfirmation = true
+                    confirmationImport = nil
+                },
+                onCancel: { confirmationImport = nil }
+            )
+        }
+    }
+
+    /// Closes the catalog after an import, but only once the confirmation sheet
+    /// has fully gone — dismissing the window while the sheet still animates
+    /// away is the same one-into-another race the sidebar's sheets had.
+    private func closeAfterConfirmationIfNeeded() {
+        guard closeAfterConfirmation else { return }
+        closeAfterConfirmation = false
+        store.cancelPreview()
+        onClose()
     }
 
     @ViewBuilder
@@ -344,6 +378,10 @@ struct AutoEQBrowserView: View {
         VStack(alignment: .leading, spacing: 12) {
             selectionSummary
 
+            if store.previewWouldAdjust, let disclosure = store.previewCandidates?.disclosure {
+                importAdjustmentNotice(for: disclosure)
+            }
+
             labeled("Measurement source") { measurementControl }
             labeled("Target curve") { targetControl }
 
@@ -351,7 +389,7 @@ struct AutoEQBrowserView: View {
                 GeometryReader { geometry in
                     FrequencyResponseView(
                         filters: profile.filters,
-                        sampleRate: 44_100,
+                        sampleRate: audioEngine.sampleRate,
                         preamp: profile.preamp,
                         compact: true,
                         showsBackground: false
@@ -390,6 +428,33 @@ struct AutoEQBrowserView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contentBlock()
+    }
+
+    /// The notice under the selected model when saving the preview would change
+    /// it: how many values CoreEQ would adjust, and how far that moves the
+    /// response. The full disclosure waits in the confirmation sheet.
+    private func importAdjustmentNotice(for disclosure: ImportDisclosure) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(Theme.Font.secondary)
+                .foregroundStyle(.orange)
+                .accessibilityHidden(true)
+
+            Text(ImportSummary.notice(for: disclosure))
+                .font(Theme.Font.secondary)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(Color.orange.opacity(0.10))
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Saving will adjust this correction")
     }
 
     private var selectionSummary: some View {
@@ -570,8 +635,10 @@ struct AutoEQBrowserView: View {
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)
 
-                    Button("Retry") { store.schedulePreview(after: 0) }
-                        .controlSize(.small)
+                    Button("Retry") {
+                        store.schedulePreview(after: 0, sampleRate: audioEngine.sampleRate)
+                    }
+                    .controlSize(.small)
                 }
             }
         }
@@ -675,7 +742,7 @@ struct AutoEQBrowserView: View {
     /// schedules a debounced preview for the new selection.
     private func selectionDidChange() {
         stopAuditionIfNeeded()
-        store.schedulePreview()
+        store.schedulePreview(sampleRate: audioEngine.sampleRate)
     }
 
     private func cancel() {
@@ -687,12 +754,20 @@ struct AutoEQBrowserView: View {
 
     /// Keeps the previewed chain as a user preset. Previewing follows the
     /// selection, so Import only commits the profile already being heard.
+    ///
+    /// The save runs through the same disclosure as every other import: a
+    /// correction CoreEQ would have to change is held in the confirmation sheet
+    /// until the user chooses, and one it can keep exact goes straight in.
     private func saveToPresets() {
-        guard let profile = store.previewProfile, canPreview else { return }
-        if !profileManager.isAuditioning {
-            profileManager.beginAudition(profile)
-        }
-        if profileManager.saveAuditionAsPreset(named: profile.name) != nil {
+        guard let candidates = store.previewCandidates, let profile = store.previewProfile,
+            canPreview
+        else { return }
+
+        let preview = profileManager.previewImport(candidates: candidates, name: profile.name)
+        if preview.requiresConfirmation {
+            confirmationImport = preview
+        } else {
+            profileManager.commitImport(preview, choice: .keepExact)
             store.cancelPreview()
             onClose()
         }

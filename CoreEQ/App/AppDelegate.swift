@@ -95,6 +95,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 sidebarWithViewController: NSHostingController(
                     rootView: EqualizerSidebarView(
                         profileManager: profileManager,
+                        audioEngine: audioEngine,
                         autoEQStore: autoEQStore,
                         openAutoEQBrowser: { AutoEQBrowserRoute.shared.requestBrowser() }
                     )

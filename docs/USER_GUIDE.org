@@ -31,7 +31,7 @@ The *Graphic* editor is the professional ISO octave ladder — 32, 64, 125, 250,
 500 Hz and 1, 2, 4, 8, 16, 20 kHz — at fixed centre frequencies, each adjustable
 ±12 dB. The *Parametric* editor adds up to sixteen bands of your own anywhere
 between 20 Hz and 20 kHz, each a bell, shelf, or pass filter with its own
-frequency, gain, and Q.
+frequency, gain (±20 dB), and Q.
 
 The two editors are tabs on the editing area's own border, and both edit the
 same chain and the same graph: the sliders are eleven filters that happen to be
@@ -89,15 +89,26 @@ preset list; every import shows what it found before anything is added. The
 *AutoEq* button beside the =+= opens the catalog directly; for a correction from
 autoeq.app by hand, use *Import by Hand…* in the catalog sheet.
 
+An import that changes nothing asks a simple *Import* / *Cancel*. An import that
+would change a value asks with a confirmation sheet instead: it lists each
+change — which filter, the value as written and the value it would become, and
+the CoreEQ limit responsible — and the measured response impact, as RMS and
+maximum dB across 20 Hz–20 kHz. When a value has no physical response to
+measure, the sheet says the impact cannot be measured rather than inventing a
+number. Values CoreEQ can represent are kept exactly by default; a bell above
+the ±12 dB graphic range can instead be clipped back onto its slider, and the
+sheet shows what that would cost. Nothing is written until you confirm.
+
 From EqualizerAPO text, CoreEQ reads =Preamp:= and =PK=, =LSC=, =HSC=, =HP= and
 =LP= filters, with Q or bandwidth in octaves. It reads UTF-8, UTF-16 and
-Windows-1252 files. A preset holds up to sixteen filters, gain and preamp within
-±12 dB, frequency 20 Hz–20 kHz and Q 0.1–10. A longer file keeps its pass
-filters and its strongest bands, and values out of range are brought into it;
-the preview says when either happened. =GraphicEQ:=, =Channel:= and other
-EqualizerAPO commands are skipped and listed in the preview — so filters meant
-for one channel apply to both. A file without a =Preamp:= line gets the
-automatic trim.
+Windows-1252 files. A preset holds up to sixteen free filters with gain within
+±20 dB, frequency 20 Hz–20 kHz and Q 0.1–10. Graphic bands and preamp stay within
+±12 dB. A longer file keeps its pass filters and its strongest bands, and any
+value brought into range is disclosed before it is added. Previously imported
+presets whose gains were clamped must be reimported from the original file to
+recover them. =GraphicEQ:=, =Channel:= and other EqualizerAPO commands are
+skipped and listed in the preview — so filters meant for one channel apply to
+both. A file without a =Preamp:= line gets the automatic trim.
 
 Export is on a preset's right-click menu, as EqualizerAPO text or =.coreeq=.
 Exporting the preset you are listening to writes what you hear, unsaved edits
@@ -132,6 +143,15 @@ without saving anything, so you can hear it against your own music. *Cancel*
 puts the previous sound back. *Import* converts the correction and keeps it as
 one of your own presets, named after the model, where it can be edited and
 exported like any other.
+
+The catalog never refuses a correction CoreEQ can represent. When saving one
+would change it to fit CoreEQ, the browser says so, and *Import* opens the same
+confirmation sheet the manual imports use: each changed value with its response
+impact, and the choice to keep it exact or clip a beyond-slider bell back into
+the graphic range. If another filter occupies that slider, the clipped bell
+remains a free filter at ±12 dB. Impact is measured at the active device rate.
+The preview you hear is the correction kept exact, and a
+correction that needs no change imports without a sheet.
 
 No catalog or profiles are bundled with the app. Opening the AutoEq sheet for
 the first time downloads the catalog and shows a progress bar; Cancel stops
