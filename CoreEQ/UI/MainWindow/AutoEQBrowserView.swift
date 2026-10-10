@@ -370,9 +370,19 @@ struct AutoEQBrowserView: View {
                 .accessibilityLabel("Preview response curve")
             }
 
+            if store.selectedVariant != nil {
+                Text(
+                    store.selectedTargetLabel == AutoEQCatalogParser.defaultTargetLabel
+                        ? "Published correction by AutoEq"
+                        : "Computed by CoreEQ using AutoEq target data"
+                )
+                .font(Theme.Font.secondary)
+                .foregroundStyle(.secondary)
+            }
+
             if store.selectedVariant != nil && !store.supportsCustomTargets {
                 Text(
-                    "Alternative targets are unavailable until this measurement source grants clear local processing rights. Uses AutoEq’s published correction."
+                    "No compatible alternative targets are available for this measurement. Uses AutoEq’s published correction."
                 )
                 .font(Theme.Font.secondary)
                 .foregroundStyle(.secondary)
@@ -539,7 +549,7 @@ struct AutoEQBrowserView: View {
                         .controlSize(.small)
                     Text(
                         store.selectedTargetLabel == AutoEQCatalogParser.defaultTargetLabel
-                            ? "Loading correction…" : "Computing correction locally…"
+                            ? "Loading correction…" : "Computing correction in CoreEQ…"
                     )
                     .font(Theme.Font.label)
                     .foregroundStyle(.secondary)
@@ -602,7 +612,7 @@ struct AutoEQBrowserView: View {
     /// rather than read.
     private var attributionFooter: some View {
         HStack(spacing: 4) {
-            Text("Corrections from")
+            Text("Data from")
             Link("AutoEq", destination: Self.autoEQRepository)
             Text(attributionCredit)
         }
